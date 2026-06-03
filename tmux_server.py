@@ -7,18 +7,82 @@ Serves tmux state as JSON on http://localhost:8765/api/tmux
 
 import subprocess
 import json
+import shlex
+import re
+import os
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+_ANSI = re.compile(r'\x1b\[[0-9;]*m')
+HOME = os.path.expanduser("~")
+# Cap on concurrent capture-pane subprocesses per request. Captures run in
+# threads; run() spends its time in subprocess (GIL released), so this gives
+# near-linear speedup and bounds total wall time to ~one slow capture.
+MAX_CAPTURE_WORKERS = 16
 
 PORT = 8765
 PREVIEW_LINES = 5
+# A single tmux call is capped well under the frontend's fetch-abort window
+# (8s) so one stuck capture-pane can't blow the whole /api/tmux response.
+RUN_TIMEOUT = 2
+# How many trailing lines to capture per pane. Bounded on purpose: a heavy
+# full-screen TUI (e.g. Claude Code) can fill the whole visible pane, and we
+# only ever keep the last PREVIEW_LINES non-empty ones. Capturing a small
+# bottom slice keeps each call cheap regardless of pane height / activity.
+CAPTURE_LINES = 20
 
 
 def run(cmd):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=RUN_TIMEOUT)
         return r.stdout.strip()
     except Exception:
         return ""
+
+
+def capture_cmd(target):
+    # -S -N / -E -1 bounds the capture to the bottom N lines instead of the
+    # full visible pane, so cost is independent of how much the app redraws.
+    # shlex.quote(target) so a session name containing a quote/space can't
+    # break out of the -t argument.
+    return (
+        f"tmux capture-pane -t {shlex.quote(target)} -p -J "
+        f"-S -{CAPTURE_LINES} -E -1 2>/dev/null"
+    )
+
+
+def fetch_preview(target):
+    # Capture the pane, keep the last PREVIEW_LINES non-empty lines, strip ANSI.
+    # Must never raise: this runs inside a parallel map(), and an exception
+    # there would abort the entire /api/tmux response (→ 500 → dashboard flash).
+    try:
+        raw = run(capture_cmd(target))
+        lines = [l for l in raw.splitlines() if l.strip()][-PREVIEW_LINES:]
+        return [_ANSI.sub('', l).rstrip() for l in lines]
+    except Exception:
+        return []
+
+
+def parse_pane_fields(line, host):
+    # Field order MUST match the list-panes -F format below. pane_title is
+    # user-controlled and may itself contain the '|' delimiter, so it is the
+    # LAST field and we split with maxsplit=6 to keep it intact.
+    parts = line.split("|", 6)
+    if len(parts) < 7:
+        return None
+    pidx, pactive, pcmd, ppath, pwidth, pheight, ptitle = parts
+    # default pane_title is the hostname — treat that as "no custom title"
+    # so we fall back to the running command in the UI.
+    title = ptitle if (ptitle and ptitle != host) else ""
+    return {
+        "index": pidx,
+        "active": pactive,
+        "command": pcmd,
+        "path": ppath,
+        "width": pwidth,
+        "height": pheight,
+        "title": title,
+    }
 
 
 def get_tmux_state():
@@ -29,8 +93,10 @@ def get_tmux_state():
     current_session = run("tmux display-message -p '#{session_name}'")
     current_window = run("tmux display-message -p '#{window_index}'")
     current_pane   = run("tmux display-message -p '#{pane_index}'")
+    host           = run("tmux display-message -p '#{host_short}'")
 
     sessions = []
+    preview_jobs = []   # (target, pane_dict) — previews fetched in parallel below
     for sline in sessions_raw.splitlines():
         parts = sline.split("|")
         if len(parts) < 3:
@@ -51,32 +117,20 @@ def get_tmux_state():
 
             panes_raw = run(
                 f"tmux list-panes -t '{sname}:{widx}' "
-                f"-F '#{{pane_index}}|#{{pane_active}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_width}}|#{{pane_height}}'"
+                f"-F '#{{pane_index}}|#{{pane_active}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_width}}|#{{pane_height}}|#{{pane_title}}'"
             )
 
             panes = []
             for pline in panes_raw.splitlines():
-                pparts = pline.split("|")
-                if len(pparts) < 6:
+                f = parse_pane_fields(pline, host)
+                if f is None:
                     continue
-                pidx, pactive, pcmd, ppath, pwidth, pheight = pparts
-
-                # capture last N non-empty lines
-                raw_preview = run(
-                    f"tmux capture-pane -t '{sname}:{widx}.{pidx}' -p -J 2>/dev/null"
+                pidx, pactive, pcmd, ppath, pwidth, pheight = (
+                    f["index"], f["active"], f["command"],
+                    f["path"], f["width"], f["height"],
                 )
-                preview_lines = [
-                    l for l in raw_preview.splitlines() if l.strip()
-                ][-PREVIEW_LINES:]
 
-                import re
-                ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-                preview_lines = [ansi_escape.sub('', l).rstrip() for l in preview_lines]
-
-                # shorten path
-                import os
-                home = os.path.expanduser("~")
-                short_path = ppath.replace(home, "~")
+                short_path = ppath.replace(HOME, "~")
 
                 is_current = (
                     sname == current_session
@@ -84,15 +138,18 @@ def get_tmux_state():
                     and pidx == current_pane
                 )
 
-                panes.append({
+                pane = {
                     "index": pidx,
                     "active": pactive == "1",
                     "current": is_current,
                     "command": pcmd,
+                    "title": f["title"],
                     "path": short_path,
                     "size": f"{pwidth}×{pheight}",
-                    "preview": preview_lines,
-                })
+                    "preview": [],   # filled in parallel after the tree is built
+                }
+                panes.append(pane)
+                preview_jobs.append((f"{sname}:{widx}.{pidx}", pane))
 
             windows.append({
                 "index": widx,
@@ -109,6 +166,18 @@ def get_tmux_state():
             "current": sname == current_session,
             "windows": windows,
         })
+
+    # Fetch all pane previews in parallel — this is the expensive part (one
+    # capture-pane subprocess each). Serial, ~14 panes under load could spike
+    # past the frontend's abort window; parallel bounds it to ~one capture.
+    if preview_jobs:
+        workers = min(MAX_CAPTURE_WORKERS, len(preview_jobs))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for pane, preview in zip(
+                (p for _, p in preview_jobs),
+                ex.map(lambda job: fetch_preview(job[0]), preview_jobs),
+            ):
+                pane["preview"] = preview
 
     return {"sessions": sessions}
 

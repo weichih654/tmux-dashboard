@@ -285,7 +285,7 @@
   /* ── panes grid ── */
   .panes {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
     gap: 8px;
     padding: 6px 0 0;
     background: transparent;
@@ -370,6 +370,7 @@
     letter-spacing: 0.3px;
     display: inline-flex;
     align-items: center;
+    align-self: center;   /* badge stays centered; text siblings use baseline */
     gap: 4px;
   }
   .busy-badge .act-dot {
@@ -380,11 +381,21 @@
     animation: busy-pulse 1.1s ease-in-out infinite;
   }
 
+  /* pane title — a complete, standalone line with nothing flanking it,
+     so it can use the full card width */
   .pane-top {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 2px;
+    margin-bottom: 4px;
+  }
+
+  .pane-cmd {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.1px;
+    color: var(--cmd);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .pane-idx {
@@ -393,14 +404,27 @@
     min-width: 16px;
   }
 
-  .pane-cmd {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--cmd);
-    flex: 1;
+  .pane-spacer { flex: 1 1 auto; }
+
+  /* secondary line: idx + command tag (left) · HERE / activity / size (right) */
+  .pane-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    min-height: 16px;     /* keep cards aligned whether or not a tag shows */
+  }
+
+  .pane-proc {
+    font-size: 9px;
+    color: var(--muted);
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 5px;
+    align-self: center;   /* tag stays centered; text siblings use baseline */
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    flex-shrink: 0;
   }
 
   .pane-size {
@@ -411,6 +435,7 @@
   .active-mark {
     display: inline-flex;
     align-items: center;
+    align-self: center;   /* pill stays centered; text siblings use baseline */
     gap: 3px;
     font-size: 9px;
     font-weight: 700;
@@ -618,10 +643,22 @@ function render(data) {
             ).join('')}</div>`
           : '';
 
+        // Main label is the tmux pane title (set via `select-pane -T` / escape
+        // seq); fall back to the running command when no custom title is set.
+        // When a title IS set, the command is shown as a small secondary tag.
+        const hasTitle = pane.title && pane.title !== pane.command;
+        const mainLabel = pane.title || pane.command;
+        const procTag = hasTitle
+          ? `<span class="pane-proc">${escHtml(pane.command)}</span>` : '';
+
         return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${busy ? ' is-busy' : ''}">
           <div class="pane-top">
+            <span class="pane-cmd" title="${escHtml(mainLabel)}">${escHtml(mainLabel)}</span>
+          </div>
+          <div class="pane-meta">
             <span class="pane-idx">${pane.index}</span>
-            <span class="pane-cmd">${escHtml(pane.command)}</span>
+            ${procTag}
+            <span class="pane-spacer"></span>
             ${pane.current ? '<span class="active-mark">▸ HERE</span>' : ''}
             ${busy ? '<span class="busy-badge"><span class="act-dot"></span>activity</span>' : ''}
             <span class="pane-size">${pane.size}</span>
@@ -707,7 +744,7 @@ function makeDemoData() {
       { index: '0', name: 'editor', active: true, panes: [
         // nvim: cursor lives here (HERE), static content → no activity
         { index: '0', active: true, current: hereOnEditor,
-          command: 'nvim', path: '~/dev/tmux-dashboard', size: '96×42',
+          command: 'nvim', title: 'edit dashboard', path: '~/dev/tmux-dashboard', size: '96×42',
           preview: ['  1 <!DOCTYPE html>', '  2 <html lang="zh-Hant">', '  3 <head>',
             '  4   <meta charset="UTF-8">', '  5   <title>tmux.dash</title>',
             '  6 </head>', '  7 <body>'] },
@@ -721,7 +758,7 @@ function makeDemoData() {
       { index: '1', name: 'server', active: false, panes: [
         // python3 api: logs every tick → steadily lit (activity)
         { index: '0', active: true, current: !hereOnEditor,
-          command: 'python3', path: '~/dev/tmux-dashboard', size: '120×50',
+          command: 'python3', title: 'api server', path: '~/dev/tmux-dashboard', size: '120×50',
           preview: ['  tmux dashboard server running → :8765', 'Ctrl-C to stop',
             '127.0.0.1 - GET /api/tmux 200', '127.0.0.1 - GET /api/tmux 200',
             '127.0.0.1 - GET /api/tmux 200', '127.0.0.1 - GET /api/tmux 200  ' + stamp] },
@@ -750,25 +787,48 @@ const DEMO = (() => {
   return v !== null && v !== 'false' && v !== '0';
 })();
 
+// Guard against overlapping polls: a slow server response (many panes /
+// busy TUI) must not let the next interval tick fire a second request on
+// top of it — overlapping fetches pile load on tmux and cause the flicker.
+let inFlight = false;
+
+// A single slow/aborted poll must NOT wipe the last good view — that's the
+// "flash". Tolerate transient failures: keep the existing render and only
+// fall back to the error state after FAIL_THRESHOLD consecutive failures.
+let failCount = 0;
+const FAIL_THRESHOLD = 2;
+
 async function fetchData() {
   if (DEMO) {
     document.body.classList.add('demo');
     render(makeDemoData());
     return;
   }
+  if (inFlight) return;   // previous poll still running — skip this tick
+  inFlight = true;
   try {
-    const res = await fetch(API, { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+    // Abort window is generous (8s) so a normal — parallel-fetched — server
+    // response always finishes; only a truly dead server trips the catch.
+    const res = await fetch(API, { cache: 'no-store', signal: AbortSignal.timeout(8000) });
     const data = await res.json();
+    failCount = 0;
     document.body.classList.remove('demo');
     render(data);
   } catch (e) {
-    document.body.classList.remove('demo');
+    failCount++;
+    // dim the status dot immediately, but keep the last good render so a
+    // one-off timeout doesn't flash the whole UI to an error screen.
     document.getElementById('status-dot').className = 'status-dot error';
-    document.getElementById('main').innerHTML = `<div class="empty">
-      <h2>cannot connect</h2>
-      <p>make sure <code>python3 tmux_server.py</code> is running</p>
-      <p class="empty-link"><a href="?demo=true">view demo with sample data →</a></p>
-    </div>`;
+    if (failCount >= FAIL_THRESHOLD) {
+      document.body.classList.remove('demo');
+      document.getElementById('main').innerHTML = `<div class="empty">
+        <h2>cannot connect</h2>
+        <p>make sure <code>python3 tmux_server.py</code> is running</p>
+        <p class="empty-link"><a href="?demo=true">view demo with sample data →</a></p>
+      </div>`;
+    }
+  } finally {
+    inFlight = false;
   }
 }
 
