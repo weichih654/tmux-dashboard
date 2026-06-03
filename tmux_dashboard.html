@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tmux dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Syne:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0e1012;
+    --bg2:       #141618;
+    --bg3:       #191c1f;
+    --border:    #242729;
+    --border2:   #2e3235;
+
+    --text:      #d4d8de;
+    --muted:     #525a62;
+    --dim:       #333a40;
+
+    --session:   #4a9eff;
+    --window:    #e6a94a;
+    --active:    #3dd68c;
+    --cmd:       #7ec8e3;
+    --path:      #6b9fd4;
+    --preview:   #8a96a2;
+
+    --current-bg: rgba(61, 214, 140, 0.05);
+    --current-border: rgba(61, 214, 140, 0.22);
+
+    --radius: 8px;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Syne', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    min-height: 100vh;
+    padding: 0;
+  }
+
+  /* ── header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 14px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 15px;
+    color: #fff;
+    letter-spacing: -0.3px;
+  }
+
+  .logo span {
+    color: var(--active);
+  }
+
+  .badge {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 20px;
+    background: rgba(91, 138, 245, 0.15);
+    color: var(--session);
+    border: 1px solid rgba(91, 138, 245, 0.2);
+    font-weight: 500;
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  #clock {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 300;
+    letter-spacing: 0.5px;
+  }
+
+  .status-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--active);
+    box-shadow: 0 0 6px var(--active);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .status-dot.error { background: #f05a5a; box-shadow: 0 0 6px #f05a5a; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* refresh slider */
+  .refresh-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 10px;
+  }
+  input[type=range] {
+    -webkit-appearance: none;
+    width: 60px; height: 3px;
+    background: var(--border2);
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--session);
+    cursor: pointer;
+  }
+
+  /* ── main layout ── */
+  main {
+    padding: 10px 12px 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  /* ── error / empty state ── */
+  .empty {
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--muted);
+  }
+  .empty h2 { font-family: var(--sans); font-size: 18px; margin-bottom: 8px; color: var(--dim); }
+  .empty code {
+    font-family: var(--mono);
+    color: var(--text);
+    background: var(--bg3);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .empty-link { margin-top: 14px; }
+  .empty-link a {
+    color: var(--session);
+    text-decoration: none;
+    font-size: 11px;
+  }
+  .empty-link a:hover { text-decoration: underline; }
+
+  /* ── session block ── */
+  .session {
+    background: transparent;
+  }
+
+  .session-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 4px;
+    border-radius: 6px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s;
+  }
+  .session-header:hover { background: rgba(255,255,255,0.03); }
+
+  .session-icon {
+    font-size: 9px;
+    color: var(--session);
+    transition: transform 0.2s;
+  }
+  .session.collapsed .session-icon { transform: rotate(-90deg); }
+
+  .session-name {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--session);
+    letter-spacing: -0.2px;
+  }
+
+  .session-meta {
+    font-size: 10px;
+    color: var(--muted);
+    white-space: nowrap;
+    margin-left: 4px;
+  }
+
+  .tag {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-left: auto;
+  }
+  .tag.attached  { background: rgba(80,216,144,0.12); color: var(--active); border: 1px solid rgba(80,216,144,0.2); }
+  .tag.current   { background: rgba(80,216,144,0.18); color: var(--active); font-weight: 600; }
+  .tag.detached  { background: rgba(78,90,120,0.2);   color: var(--muted);  border: 1px solid var(--border); }
+
+  /* ── windows list ── */
+  .windows {
+    padding: 4px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .session.collapsed .windows { display: none; }
+
+  /* ── window group (no box — just a label + pane cards) ── */
+  .window {
+    background: transparent;
+  }
+
+  /* a pane has new output → breathing glow on THAT pane only (V01) */
+  @keyframes activity-breathe {
+    0%, 100% { box-shadow: inset 0 0 0 1px rgba(230,169,74,0.55), 0 0 11px rgba(230,169,74,0.14); }
+    50%      { box-shadow: inset 0 0 0 1px rgba(230,169,74,0.90), 0 0 20px rgba(230,169,74,0.32); }
+  }
+
+  .window-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 4px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .window-header:hover { background: rgba(255,255,255,0.03); }
+
+  .win-indicator {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--dim);
+    flex-shrink: 0;
+  }
+  .window.is-active .win-indicator { background: var(--window); }
+
+  .win-index {
+    font-size: 10px;
+    color: var(--muted);
+    min-width: 18px;
+  }
+
+  .win-name {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--window);
+    flex: 1;
+  }
+  .window:not(.is-active) .win-name { color: var(--text); }
+
+  .win-pane-count {
+    font-size: 10px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .win-collapse-icon {
+    font-size: 9px;
+    color: var(--dim);
+    transition: transform 0.2s;
+  }
+  .window.collapsed .win-collapse-icon { transform: rotate(-90deg); }
+
+  /* ── panes grid ── */
+  .panes {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+    padding: 6px 0 0;
+    background: transparent;
+  }
+  .window.collapsed .panes { display: none; }
+
+  /* ── pane cell ── */
+  .pane {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 11px;
+    position: relative;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .pane:hover { background: #1e2330; border-color: var(--border2); }
+
+  .pane.is-active {
+    background: rgba(80, 216, 144, 0.05);
+    border-color: rgba(80,216,144,0.22);
+  }
+  .pane.is-current {
+    background: rgba(80, 216, 144, 0.10);
+    border-color: rgba(80,216,144,0.35);
+  }
+
+  /* active accent — rounded inset bar (plays nice with the pane radius) */
+  .pane.is-active::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 9px; bottom: 9px;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: var(--active);
+  }
+
+  /* current pane = where your cursor actually is — stronger, glowing bar */
+  .pane.is-current::before {
+    width: 4px;
+    background: var(--active);
+    box-shadow: 0 0 9px rgba(61,214,140,0.65);
+  }
+
+  /* activity indicator in the window header */
+  .win-activity {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: auto;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: var(--window);
+  }
+  .win-activity .act-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--window);
+    box-shadow: 0 0 6px var(--window);
+    animation: busy-pulse 1.1s ease-in-out infinite;
+  }
+  /* per-pane glow already signals activity — only roll it up to the
+     header when the window is collapsed and the panes are hidden */
+  .window:not(.collapsed) .win-activity { display: none; }
+  /* busy = new output detected since last fetch — glow on the pane itself */
+  .pane.is-busy {
+    background: rgba(230, 169, 74, 0.07);
+    border-color: rgba(230,169,74,0.5);
+    z-index: 2;
+    animation: activity-breathe 1.6s ease-in-out infinite;
+  }
+
+  @keyframes busy-pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.2; }
+  }
+
+  .busy-badge {
+    font-size: 9px;
+    color: var(--window);
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .busy-badge .act-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--window);
+    box-shadow: 0 0 5px var(--window);
+    animation: busy-pulse 1.1s ease-in-out infinite;
+  }
+
+  .pane-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 2px;
+  }
+
+  .pane-idx {
+    font-size: 9px;
+    color: var(--dim);
+    min-width: 16px;
+  }
+
+  .pane-cmd {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--cmd);
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .pane-size {
+    font-size: 9px;
+    color: var(--dim);
+  }
+
+  .active-mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    color: #06140d;
+    background: var(--active);
+    padding: 1px 7px 1px 5px;
+    border-radius: 10px;
+    box-shadow: 0 0 7px rgba(61,214,140,0.45);
+    animation: here-glow 2s ease-in-out infinite;
+  }
+  @keyframes here-glow {
+    0%, 100% { box-shadow: 0 0 5px rgba(61,214,140,0.40); }
+    50%      { box-shadow: 0 0 13px rgba(61,214,140,0.75); }
+  }
+
+  .pane-path {
+    font-size: 10px;
+    color: var(--path);
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0.8;
+  }
+
+  /* ── preview block ── */
+  .preview {
+    background: rgba(0,0,0,0.28);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 9px;
+    color: #9fb0be;
+    line-height: 1.65;
+    overflow: hidden;
+    font-weight: 400;
+    min-height: 96px;
+  }
+
+  .preview-line {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: block;
+  }
+
+  /* ── footer stat bar ── */
+  .stat-bar {
+    display: flex;
+    gap: 20px;
+    padding: 6px 14px;
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    font-size: 10px;
+    color: var(--muted);
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+  }
+  .stat { display: flex; gap: 5px; align-items: center; }
+  .stat-val { color: var(--text); font-weight: 500; }
+
+  /* demo-mode tag in header */
+  #demo-tag {
+    display: none;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: #06140d;
+    background: var(--window);
+    padding: 2px 7px;
+    border-radius: 4px;
+    box-shadow: 0 0 8px rgba(230,169,74,0.45);
+  }
+  body.demo #demo-tag { display: inline-block; }
+  body.demo .status-dot { background: var(--window); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <div class="logo">tmux<span>.</span>dash</div>
+    <div class="badge" id="session-count">— sessions</div>
+  </div>
+  <div class="header-right">
+    <div class="refresh-control">
+      <span>refresh</span>
+      <input type="range" id="refresh-slider" min="1" max="10" value="2">
+      <span id="refresh-label">2s</span>
+    </div>
+    <div id="demo-tag" title="server not reachable — showing simulated data">DEMO</div>
+    <div id="clock">--:--:--</div>
+    <div class="status-dot" id="status-dot"></div>
+  </div>
+</header>
+
+<main id="main">
+  <div class="empty">
+    <h2>connecting…</h2>
+    <p>waiting for tmux server on localhost:8765</p>
+  </div>
+</main>
+
+<div class="stat-bar">
+  <div class="stat">sessions <span class="stat-val" id="s-sessions">—</span></div>
+  <div class="stat">windows <span class="stat-val" id="s-windows">—</span></div>
+  <div class="stat">panes <span class="stat-val" id="s-panes">—</span></div>
+  <div class="stat">last update <span class="stat-val" id="s-updated">—</span></div>
+</div>
+
+<script>
+const API = 'http://localhost:8765/api/tmux';
+let refreshSec = 2;
+let timer = null;
+
+// ── clock ──────────────────────────────────────────────────
+function tickClock() {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('zh-TW', { hour12: false });
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+// ── refresh slider ─────────────────────────────────────────
+const slider = document.getElementById('refresh-slider');
+const refreshLabel = document.getElementById('refresh-label');
+slider.addEventListener('input', () => {
+  refreshSec = +slider.value;
+  refreshLabel.textContent = refreshSec + 's';
+  reschedule();
+});
+
+// ── collapse state ─────────────────────────────────────────
+const collapsedSessions = new Set();
+const collapsedWindows  = new Set();
+
+// ── busy detection ──────────────────────────────────────────
+// A pane is "busy" for BUSY_TTL ms after its last output change.
+const BUSY_TTL = 8000;        // ms to keep busy highlight after last change
+const prevHash    = new Map(); // key → last content hash
+const lastChanged = new Map(); // key → timestamp of last change
+
+function simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+  }
+  return h.toString(36);
+}
+
+function paneKey(sessName, winIdx, paneIdx) {
+  return `${sessName}:${winIdx}.${paneIdx}`;
+}
+
+function checkBusy(key, previewLines) {
+  const hash = simpleHash(previewLines.join('\n'));
+  const now  = Date.now();
+  if (prevHash.has(key) && prevHash.get(key) !== hash) {
+    lastChanged.set(key, now);
+  }
+  prevHash.set(key, hash);
+  return lastChanged.has(key) && (now - lastChanged.get(key)) < BUSY_TTL;
+}
+
+// ── render ─────────────────────────────────────────────────
+function render(data) {
+  const dot = document.getElementById('status-dot');
+  const main = document.getElementById('main');
+
+  if (data.error || !data.sessions || data.sessions.length === 0) {
+    dot.className = 'status-dot error';
+    main.innerHTML = `<div class="empty">
+      <h2>no sessions</h2>
+      <p>${data.error || 'no active tmux sessions found'}</p>
+    </div>`;
+    return;
+  }
+
+  dot.className = 'status-dot';
+
+  let totalWindows = 0, totalPanes = 0;
+
+  const html = data.sessions.map(sess => {
+    totalWindows += sess.window_count;
+
+    const isCurrentSess = sess.current;
+    const isCollapsed   = collapsedSessions.has(sess.name);
+
+    const windowsHtml = sess.windows.map(win => {
+      totalPanes += win.panes.length;
+
+      const wkey = sess.name + ':' + win.index;
+      const winCollapsed = collapsedWindows.has(wkey);
+      const isActiveWin  = win.active;
+      let winBusy = false;
+
+      const panesHtml = win.panes.map(pane => {
+        const key = paneKey(sess.name, win.index, pane.index);
+        const busy = checkBusy(key, pane.preview);
+        if (busy) winBusy = true;
+
+        const previewHtml = pane.preview.length
+          ? `<div class="preview">${pane.preview.map(l =>
+              `<span class="preview-line">${escHtml(l)}</span>`
+            ).join('')}</div>`
+          : '';
+
+        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${busy ? ' is-busy' : ''}">
+          <div class="pane-top">
+            <span class="pane-idx">${pane.index}</span>
+            <span class="pane-cmd">${escHtml(pane.command)}</span>
+            ${pane.current ? '<span class="active-mark">▸ HERE</span>' : ''}
+            ${busy ? '<span class="busy-badge"><span class="act-dot"></span>activity</span>' : ''}
+            <span class="pane-size">${pane.size}</span>
+          </div>
+          <div class="pane-path">${escHtml(pane.path)}</div>
+          ${previewHtml}
+        </div>`;
+      }).join('');
+
+      return `<div class="window${isActiveWin ? ' is-active' : ''}${winBusy ? ' is-busy' : ''}${winCollapsed ? ' collapsed' : ''}"
+                   data-wkey="${escHtml(wkey)}">
+        <div class="window-header" onclick="toggleWindow('${escHtml(wkey)}')">
+          <div class="win-indicator"></div>
+          <div class="win-index">#${win.index}</div>
+          <div class="win-name">${escHtml(win.name)}</div>
+          <div class="win-pane-count">${win.panes.length} pane${win.panes.length !== 1 ? 's' : ''}</div>
+          ${winBusy ? '<span class="win-activity"><span class="act-dot"></span>activity</span>' : ''}
+          <div class="win-collapse-icon">▾</div>
+        </div>
+        <div class="panes">${panesHtml}</div>
+      </div>`;
+    }).join('');
+
+    const tagHtml = sess.current
+      ? '<span class="tag current">current</span>'
+      : sess.attached
+        ? '<span class="tag attached">attached</span>'
+        : '<span class="tag detached">detached</span>';
+
+    return `<div class="session${isCurrentSess ? ' is-current' : ''}${isCollapsed ? ' collapsed' : ''}"
+                 data-session="${escHtml(sess.name)}">
+      <div class="session-header" onclick="toggleSession('${escHtml(sess.name)}')">
+        <span class="session-icon">▾</span>
+        <span class="session-name">${escHtml(sess.name)}</span>
+        <span class="session-meta">${sess.window_count} win</span>
+        ${tagHtml}
+      </div>
+      <div class="windows">${windowsHtml}</div>
+    </div>`;
+  }).join('');
+
+  main.innerHTML = html;
+
+  // stats
+  document.getElementById('session-count').textContent =
+    data.sessions.length + ' session' + (data.sessions.length !== 1 ? 's' : '');
+  document.getElementById('s-sessions').textContent = data.sessions.length;
+  document.getElementById('s-windows').textContent  = totalWindows;
+  document.getElementById('s-panes').textContent    = totalPanes;
+  document.getElementById('s-updated').textContent  =
+    new Date().toLocaleTimeString('zh-TW', { hour12: false });
+}
+
+// ── collapse toggles ───────────────────────────────────────
+function toggleSession(name) {
+  if (collapsedSessions.has(name)) collapsedSessions.delete(name);
+  else collapsedSessions.add(name);
+  const el = document.querySelector(`.session[data-session="${name}"]`);
+  if (el) el.classList.toggle('collapsed');
+}
+
+function toggleWindow(wkey) {
+  if (collapsedWindows.has(wkey)) collapsedWindows.delete(wkey);
+  else collapsedWindows.add(wkey);
+  const el = document.querySelector(`.window[data-wkey="${wkey}"]`);
+  if (el) el.classList.toggle('collapsed');
+}
+
+// ── demo / simulation mode ─────────────────────────────────
+// When the server is unreachable, show simulated data that keeps
+// changing so activity glow, HERE marker, and auto-refresh are visible.
+let demoTick = 0;
+function makeDemoData() {
+  demoTick++;
+  const t = demoTick;
+  const stamp = new Date().toLocaleTimeString('zh-TW', { hour12: false });
+  // HERE marker hops between two panes every ~12 ticks
+  const hereOnEditor = Math.floor(t / 12) % 2 === 0;
+
+  return { sessions: [{
+    name: 'main', current: true, attached: true, window_count: 2,
+    windows: [
+      { index: '0', name: 'editor', active: true, panes: [
+        // nvim: cursor lives here (HERE), static content → no activity
+        { index: '0', active: true, current: hereOnEditor,
+          command: 'nvim', path: '~/dev/tmux-dashboard', size: '96×42',
+          preview: ['  1 <!DOCTYPE html>', '  2 <html lang="zh-Hant">', '  3 <head>',
+            '  4   <meta charset="UTF-8">', '  5   <title>tmux.dash</title>',
+            '  6 </head>', '  7 <body>'] },
+        // node dev server: emits a line every 3 ticks → intermittent activity
+        { index: '1', active: false, current: false,
+          command: 'node', path: '~/dev/tmux-dashboard', size: '64×42',
+          preview: ['> vite v5 ready in 312 ms', '> Local:   http://localhost:5173/',
+            '> Network: use --host to expose', '> press h + enter to show help',
+            ...(t % 3 === 0 ? ['> hmr update /src/app.jsx ' + stamp] : [])] },
+      ]},
+      { index: '1', name: 'server', active: false, panes: [
+        // python3 api: logs every tick → steadily lit (activity)
+        { index: '0', active: true, current: !hereOnEditor,
+          command: 'python3', path: '~/dev/tmux-dashboard', size: '120×50',
+          preview: ['  tmux dashboard server running → :8765', 'Ctrl-C to stop',
+            '127.0.0.1 - GET /api/tmux 200', '127.0.0.1 - GET /api/tmux 200',
+            '127.0.0.1 - GET /api/tmux 200', '127.0.0.1 - GET /api/tmux 200  ' + stamp] },
+        // htop: cpu numbers tick every 2 → intermittent activity
+        { index: '1', active: false, current: false,
+          command: 'htop', path: '~', size: '120×24',
+          preview: ['CPU[' + '|'.repeat(3 + (t % 6)) + ']  ' + (18 + (t * 7) % 40) + '%',
+            'Mem[||||||      ]  5.2G/16G', 'Swp[             ]  0K/2G',
+            'Tasks: 212, 41 running', 'load average: ' + (0.3 + (t % 5) * 0.11).toFixed(2) + ' 0.51 0.60',
+            'Uptime: 4 days, 02:17'] },
+        // tail: quiet log → no activity
+        { index: '2', active: false, current: false,
+          command: 'tail', path: '/var/log', size: '120×24',
+          preview: ['[INFO] worker started pid=4821', '[INFO] queue drained (0 pending)',
+            '[INFO] checkpoint written', '[INFO] heartbeat ok'] },
+      ]},
+    ],
+  }]};
+}
+
+// ── fetch ──────────────────────────────────────────────────
+// Demo mode is OPT-IN via ?demo=true — it never kicks in on its own,
+// so a real connection problem always surfaces honestly.
+const DEMO = (() => {
+  const v = new URLSearchParams(location.search).get('demo');
+  return v !== null && v !== 'false' && v !== '0';
+})();
+
+async function fetchData() {
+  if (DEMO) {
+    document.body.classList.add('demo');
+    render(makeDemoData());
+    return;
+  }
+  try {
+    const res = await fetch(API, { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+    const data = await res.json();
+    document.body.classList.remove('demo');
+    render(data);
+  } catch (e) {
+    document.body.classList.remove('demo');
+    document.getElementById('status-dot').className = 'status-dot error';
+    document.getElementById('main').innerHTML = `<div class="empty">
+      <h2>cannot connect</h2>
+      <p>make sure <code>python3 tmux_server.py</code> is running</p>
+      <p class="empty-link"><a href="?demo=true">view demo with sample data →</a></p>
+    </div>`;
+  }
+}
+
+function reschedule() {
+  clearInterval(timer);
+  timer = setInterval(fetchData, refreshSec * 1000);
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// kick off
+fetchData();
+reschedule();
+</script>
+</body>
+</html>
