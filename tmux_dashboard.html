@@ -358,6 +358,23 @@
     animation: activity-breathe 1.6s ease-in-out infinite;
   }
 
+  /* fading = activity stopped; slow 60-second fade back to normal */
+  @keyframes busy-fade-out {
+    from {
+      background: rgba(230, 169, 74, 0.07);
+      border-color: rgba(230,169,74,0.5);
+      box-shadow: inset 0 0 0 1px rgba(230,169,74,0.55), 0 0 11px rgba(230,169,74,0.14);
+    }
+    to {
+      background: var(--bg3);
+      border-color: var(--border);
+      box-shadow: none;
+    }
+  }
+  .pane.is-fading {
+    animation: busy-fade-out 60s linear forwards;
+  }
+
   @keyframes busy-pulse {
     0%, 100% { opacity: 1; }
     50%       { opacity: 0.2; }
@@ -497,6 +514,81 @@
   .stat { display: flex; gap: 5px; align-items: center; }
   .stat-val { color: var(--text); font-weight: 500; }
 
+  /* ── pane zoom modal ── */
+  #pane-zoom {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: rgba(0,0,0,0.72);
+    align-items: center;
+    justify-content: center;
+  }
+  #pane-zoom.open { display: flex; }
+
+  .zoom-box {
+    background: var(--bg2);
+    border: 1px solid var(--border2);
+    border-radius: 12px;
+    width: min(940px, 92vw);
+    height: min(620px, 86vh);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.65);
+  }
+
+  .zoom-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+    flex-shrink: 0;
+  }
+
+  .zoom-target { font-size: 10px; color: var(--session); font-weight: 600; flex-shrink: 0; }
+  .zoom-title  { font-size: 12px; color: var(--cmd); font-weight: 600;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .zoom-path   { font-size: 10px; color: var(--path); white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; max-width: 220px; opacity: 0.8; }
+  .zoom-close  {
+    font-size: 16px; line-height: 1; color: var(--muted); cursor: pointer;
+    padding: 2px 7px; border-radius: 4px; flex-shrink: 0;
+    transition: color 0.15s, background 0.15s;
+  }
+  .zoom-close:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+
+  .zoom-body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: auto;
+    padding: 12px 14px;
+    background: rgba(0,0,0,0.28);
+  }
+
+  .zoom-preview-line {
+    display: block;
+    font-size: 11px;
+    color: #9fb0be;
+    line-height: 1.7;
+    white-space: pre;
+    font-family: var(--mono);
+  }
+
+  .zoom-footer {
+    font-size: 9px;
+    color: var(--muted);
+    padding: 4px 14px 6px;
+    border-top: 1px solid var(--border);
+    text-align: right;
+    flex-shrink: 0;
+    background: var(--bg3);
+  }
+
+  .pane { cursor: pointer; }
+
   /* demo-mode tag in header */
   #demo-tag {
     display: none;
@@ -546,8 +638,22 @@
   <div class="stat">last update <span class="stat-val" id="s-updated">—</span></div>
 </div>
 
+<div id="pane-zoom">
+  <div class="zoom-box">
+    <div class="zoom-header">
+      <span class="zoom-target" id="zoom-target"></span>
+      <span class="zoom-title"  id="zoom-title"></span>
+      <span class="zoom-path"   id="zoom-path"></span>
+      <span class="zoom-close"  onclick="closeZoom()">✕</span>
+    </div>
+    <div class="zoom-body" id="zoom-body"></div>
+    <div class="zoom-footer" id="zoom-ts"></div>
+  </div>
+</div>
+
 <script>
-const API = 'http://localhost:8765/api/tmux';
+const API      = 'http://localhost:8765/api/tmux';
+const PANE_API = 'http://localhost:8765/api/pane';
 let refreshSec = 2;
 let timer = null;
 
@@ -573,10 +679,19 @@ const collapsedSessions = new Set();
 const collapsedWindows  = new Set();
 
 // ── busy detection ──────────────────────────────────────────
-// A pane is "busy" for BUSY_TTL ms after its last output change.
-const BUSY_TTL = 8000;        // ms to keep busy highlight after last change
-const prevHash    = new Map(); // key → last content hash
-const lastChanged = new Map(); // key → timestamp of last change
+// A pane is "busy" for BUSY_TTL ms after its last activity, then slowly
+// fades back to normal over FADE_DURATION ms.
+//
+// Two activity sources, chosen by the server (data.activity_source):
+//   'tmux' — pane_last_activity (epoch seconds), native + catches output
+//            that scrolled away between polls. Used when tmux supports it.
+//   'hash' — compare preview content between polls. Fallback for older tmux.
+const BUSY_TTL      = 8000;   // ms of active glow after last activity
+const FADE_DURATION = 60000;  // ms for the slow fade-out (1 minute)
+let   activitySource = 'hash'; // set from server response; safe default
+const prevHash    = new Map(); // key → last content hash   (hash mode)
+const lastChanged = new Map(); // key → timestamp of last change (hash mode)
+const fadeStart   = new Map(); // key → timestamp when fade-out began (hash mode)
 
 function simpleHash(str) {
   let h = 0;
@@ -590,20 +705,51 @@ function paneKey(sessName, winIdx, paneIdx) {
   return `${sessName}:${winIdx}.${paneIdx}`;
 }
 
-function checkBusy(key, previewLines) {
-  const hash = simpleHash(previewLines.join('\n'));
-  const now  = Date.now();
+// Returns { state: 'busy'|'fading'|'none', fadeElapsed: ms-into-fade }.
+// fadeElapsed feeds a negative animation-delay so the CSS fade lands at the
+// right point even though the DOM is rebuilt every render.
+function checkBusy(key, pane) {
+  const now = Date.now();
+
+  if (activitySource === 'tmux') {
+    // tmux gives the activity timestamp directly — fully stateless.
+    const elapsedMs = now - pane.last_activity * 1000;
+    if (elapsedMs < BUSY_TTL) return { state: 'busy', fadeElapsed: 0 };
+    const fadeElapsed = elapsedMs - BUSY_TTL;
+    if (fadeElapsed < FADE_DURATION) return { state: 'fading', fadeElapsed };
+    return { state: 'none', fadeElapsed: 0 };
+  }
+
+  // hash fallback — detect activity by content change between polls
+  const hash = simpleHash(pane.preview.join('\n'));
   if (prevHash.has(key) && prevHash.get(key) !== hash) {
     lastChanged.set(key, now);
+    fadeStart.delete(key);   // new activity cancels any in-progress fade
   }
   prevHash.set(key, hash);
-  return lastChanged.has(key) && (now - lastChanged.get(key)) < BUSY_TTL;
+
+  const changed = lastChanged.get(key);
+  if (!changed) return { state: 'none', fadeElapsed: 0 };
+  if ((now - changed) < BUSY_TTL) return { state: 'busy', fadeElapsed: 0 };
+
+  // Past the active glow window — start or continue the slow fade
+  if (!fadeStart.has(key)) fadeStart.set(key, now);
+  const fadeElapsed = now - fadeStart.get(key);
+  if (fadeElapsed >= FADE_DURATION) {
+    fadeStart.delete(key);
+    lastChanged.delete(key);
+    return { state: 'none', fadeElapsed: 0 };
+  }
+  return { state: 'fading', fadeElapsed };
 }
 
 // ── render ─────────────────────────────────────────────────
 function render(data) {
   const dot = document.getElementById('status-dot');
   const main = document.getElementById('main');
+
+  // Pick activity-detection mode from the server (tmux-native vs hash).
+  if (data.activity_source) activitySource = data.activity_source;
 
   if (data.error || !data.sessions || data.sessions.length === 0) {
     dot.className = 'status-dot error';
@@ -634,8 +780,10 @@ function render(data) {
 
       const panesHtml = win.panes.map(pane => {
         const key = paneKey(sess.name, win.index, pane.index);
-        const busy = checkBusy(key, pane.preview);
-        if (busy) winBusy = true;
+        const { state: busyState, fadeElapsed } = checkBusy(key, pane);
+        const isBusy   = busyState === 'busy';
+        const isFading = busyState === 'fading';
+        if (isBusy) winBusy = true;  // window badge only for active busy, not slow fade
 
         const previewHtml = pane.preview.length
           ? `<div class="preview">${pane.preview.map(l =>
@@ -651,7 +799,13 @@ function render(data) {
         const procTag = hasTitle
           ? `<span class="pane-proc">${escHtml(pane.command)}</span>` : '';
 
-        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${busy ? ' is-busy' : ''}">
+        // For fading panes, use a negative animation-delay so the CSS animation
+        // starts at the correct elapsed point even after DOM reconstruction.
+        const fadeStyle = isFading ? ` style="animation-delay:-${fadeElapsed}ms"` : '';
+
+        const zTarget = `${sess.name}:${win.index}.${pane.index}`;
+        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isFading ? ' is-fading' : ''}"${fadeStyle}
+          onclick="event.stopPropagation();openZoom('${escHtml(zTarget)}','${escHtml(mainLabel)}','${escHtml(pane.path)}')">
           <div class="pane-top">
             <span class="pane-cmd" title="${escHtml(mainLabel)}">${escHtml(mainLabel)}</span>
           </div>
@@ -660,7 +814,7 @@ function render(data) {
             ${procTag}
             <span class="pane-spacer"></span>
             ${pane.current ? '<span class="active-mark">▸ HERE</span>' : ''}
-            ${busy ? '<span class="busy-badge"><span class="act-dot"></span>activity</span>' : ''}
+            ${isBusy ? '<span class="busy-badge"><span class="act-dot"></span>activity</span>' : ''}
             <span class="pane-size">${pane.size}</span>
           </div>
           <div class="pane-path">${escHtml(pane.path)}</div>
@@ -835,13 +989,66 @@ async function fetchData() {
 function reschedule() {
   clearInterval(timer);
   timer = setInterval(fetchData, refreshSec * 1000);
+  if (zoomTarget) {
+    clearInterval(zoomTimer);
+    zoomTimer = setInterval(fetchZoom, refreshSec * 1000);
+  }
 }
 
 function escHtml(s) {
   return String(s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
+
+// ── pane zoom modal ────────────────────────────────────────
+let zoomTarget = null;
+let zoomTimer  = null;
+
+function openZoom(target, title, path) {
+  zoomTarget = target;
+  document.getElementById('zoom-target').textContent = target;
+  document.getElementById('zoom-title').textContent  = title || target;
+  document.getElementById('zoom-path').textContent   = path  || '';
+  document.getElementById('pane-zoom').classList.add('open');
+  fetchZoom();
+  clearInterval(zoomTimer);
+  zoomTimer = setInterval(fetchZoom, refreshSec * 1000);
+}
+
+function closeZoom() {
+  document.getElementById('pane-zoom').classList.remove('open');
+  clearInterval(zoomTimer);
+  zoomTimer  = null;
+  zoomTarget = null;
+}
+
+async function fetchZoom() {
+  if (!zoomTarget) return;
+  try {
+    const body = document.getElementById('zoom-body');
+    const atBottom = body.scrollHeight - body.scrollTop <= body.clientHeight + 5;
+    const res = await fetch(
+      `${PANE_API}?target=${encodeURIComponent(zoomTarget)}`,
+      { cache: 'no-store', signal: AbortSignal.timeout(5000) }
+    );
+    const data = await res.json();
+    body.innerHTML = data.lines.length
+      ? data.lines.map(l => `<span class="zoom-preview-line">${escHtml(l)}</span>`).join('')
+      : '<span class="zoom-preview-line" style="color:var(--muted)">— pane is empty —</span>';
+    if (atBottom) body.scrollTop = body.scrollHeight;
+    document.getElementById('zoom-ts').textContent =
+      'updated ' + new Date().toLocaleTimeString('zh-TW', { hour12: false });
+  } catch(e) { /* keep last render on transient failure */ }
+}
+
+// close on backdrop click (target must be the overlay itself, not the inner box)
+document.getElementById('pane-zoom').addEventListener('click', function(e) {
+  if (e.target === this) closeZoom();
+});
+
+// ESC to close
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeZoom(); });
 
 // kick off
 fetchData();

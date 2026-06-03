@@ -12,6 +12,7 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 _ANSI = re.compile(r'\x1b\[[0-9;]*m')
 HOME = os.path.expanduser("~")
@@ -22,6 +23,7 @@ MAX_CAPTURE_WORKERS = 16
 
 PORT = 8765
 PREVIEW_LINES = 5
+ZOOM_LINES = 50
 # A single tmux call is capped well under the frontend's fetch-abort window
 # (8s) so one stuck capture-pane can't blow the whole /api/tmux response.
 RUN_TIMEOUT = 2
@@ -40,14 +42,37 @@ def run(cmd):
         return ""
 
 
-def capture_cmd(target):
+# Cached result of the pane_last_activity capability probe. None = not yet
+# confirmed; True once confirmed. tmux >= the version that added the variable
+# expands it to an epoch number; older tmux (e.g. 3.5) leaves it empty.
+# Only a confirmed-positive is cached — a negative/empty result (which a
+# transient tmux failure also produces) is NOT cached, so one bad probe can't
+# lock the server into hash mode forever, and a later tmux upgrade is picked up.
+_PANE_LAST_ACTIVITY_SUPPORT = None
+
+
+def tmux_supports_pane_last_activity():
+    # Ask tmux to expand #{pane_last_activity}. A tmux that knows the variable
+    # returns an epoch integer; an unknown format variable expands to empty.
+    # Once confirmed, the result is cached so the probe stops running a
+    # subprocess on every /api/tmux request.
+    global _PANE_LAST_ACTIVITY_SUPPORT
+    if _PANE_LAST_ACTIVITY_SUPPORT is None:
+        out = run("tmux display-message -p '#{pane_last_activity}'")
+        if out.strip().isdigit():
+            _PANE_LAST_ACTIVITY_SUPPORT = True
+    return _PANE_LAST_ACTIVITY_SUPPORT is True
+
+
+def capture_cmd(target, nlines=None):
     # -S -N / -E -1 bounds the capture to the bottom N lines instead of the
     # full visible pane, so cost is independent of how much the app redraws.
     # shlex.quote(target) so a session name containing a quote/space can't
     # break out of the -t argument.
+    n = nlines if nlines is not None else CAPTURE_LINES
     return (
         f"tmux capture-pane -t {shlex.quote(target)} -p -J "
-        f"-S -{CAPTURE_LINES} -E -1 2>/dev/null"
+        f"-S -{n} -E -1 2>/dev/null"
     )
 
 
@@ -63,14 +88,35 @@ def fetch_preview(target):
         return []
 
 
-def parse_pane_fields(line, host):
+def fetch_zoom(target):
+    # Same as fetch_preview but captures ZOOM_LINES for the zoom modal.
+    # Must never raise — called from the HTTP handler on the main thread.
+    try:
+        raw = run(capture_cmd(target, ZOOM_LINES))
+        lines = [l for l in raw.splitlines() if l.strip()][-ZOOM_LINES:]
+        return [_ANSI.sub('', l).rstrip() for l in lines]
+    except Exception:
+        return []
+
+
+def parse_pane_fields(line, host, with_activity=False):
     # Field order MUST match the list-panes -F format below. pane_title is
     # user-controlled and may itself contain the '|' delimiter, so it is the
-    # LAST field and we split with maxsplit=6 to keep it intact.
-    parts = line.split("|", 6)
-    if len(parts) < 7:
-        return None
-    pidx, pactive, pcmd, ppath, pwidth, pheight, ptitle = parts
+    # LAST field and we split with a maxsplit that keeps it intact.
+    # When with_activity is True, pane_last_activity (epoch seconds) is the
+    # 7th field, before pane_title.
+    last_activity = 0
+    if with_activity:
+        parts = line.split("|", 7)
+        if len(parts) < 8:
+            return None
+        pidx, pactive, pcmd, ppath, pwidth, pheight, plastact, ptitle = parts
+        last_activity = int(plastact) if plastact.isdigit() else 0
+    else:
+        parts = line.split("|", 6)
+        if len(parts) < 7:
+            return None
+        pidx, pactive, pcmd, ppath, pwidth, pheight, ptitle = parts
     # default pane_title is the hostname — treat that as "no custom title"
     # so we fall back to the running command in the UI.
     title = ptitle if (ptitle and ptitle != host) else ""
@@ -81,6 +127,7 @@ def parse_pane_fields(line, host):
         "path": ppath,
         "width": pwidth,
         "height": pheight,
+        "last_activity": last_activity,
         "title": title,
     }
 
@@ -94,6 +141,17 @@ def get_tmux_state():
     current_window = run("tmux display-message -p '#{window_index}'")
     current_pane   = run("tmux display-message -p '#{pane_index}'")
     host           = run("tmux display-message -p '#{host_short}'")
+
+    # Prefer tmux-native pane_last_activity when available; otherwise the
+    # frontend falls back to hash-comparing pane previews.
+    use_activity = tmux_supports_pane_last_activity()
+    pane_fmt = (
+        "#{pane_index}|#{pane_active}|#{pane_current_command}|#{pane_current_path}"
+        "|#{pane_width}|#{pane_height}|#{pane_last_activity}|#{pane_title}"
+        if use_activity else
+        "#{pane_index}|#{pane_active}|#{pane_current_command}|#{pane_current_path}"
+        "|#{pane_width}|#{pane_height}|#{pane_title}"
+    )
 
     sessions = []
     preview_jobs = []   # (target, pane_dict) — previews fetched in parallel below
@@ -116,13 +174,12 @@ def get_tmux_state():
             widx, wname, wactive, wpanes = wparts[0], wparts[1], wparts[2], wparts[3]
 
             panes_raw = run(
-                f"tmux list-panes -t '{sname}:{widx}' "
-                f"-F '#{{pane_index}}|#{{pane_active}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_width}}|#{{pane_height}}|#{{pane_title}}'"
+                f"tmux list-panes -t '{sname}:{widx}' -F '{pane_fmt}'"
             )
 
             panes = []
             for pline in panes_raw.splitlines():
-                f = parse_pane_fields(pline, host)
+                f = parse_pane_fields(pline, host, with_activity=use_activity)
                 if f is None:
                     continue
                 pidx, pactive, pcmd, ppath, pwidth, pheight = (
@@ -146,6 +203,7 @@ def get_tmux_state():
                     "title": f["title"],
                     "path": short_path,
                     "size": f"{pwidth}×{pheight}",
+                    "last_activity": f["last_activity"],
                     "preview": [],   # filled in parallel after the tree is built
                 }
                 panes.append(pane)
@@ -179,7 +237,10 @@ def get_tmux_state():
             ):
                 pane["preview"] = preview
 
-    return {"sessions": sessions}
+    return {
+        "sessions": sessions,
+        "activity_source": "tmux" if use_activity else "hash",
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -190,6 +251,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/tmux":
                 payload = json.dumps(get_tmux_state()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            elif self.path.startswith("/api/pane"):
+                params = parse_qs(urlparse(self.path).query)
+                target = params.get("target", [""])[0]
+                if not target:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                payload = json.dumps({"lines": fetch_zoom(target)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
