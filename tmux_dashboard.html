@@ -266,8 +266,8 @@
     font-size: 12px;
     font-weight: 500;
     color: var(--window);
-    flex: 1;
   }
+  .win-spacer { flex: 1 1 auto; }
   .window:not(.is-active) .win-name { color: var(--text); }
 
   .win-pane-count {
@@ -282,6 +282,16 @@
     transition: transform 0.2s;
   }
   .window.collapsed .win-collapse-icon { transform: rotate(-90deg); }
+
+  /* collapsed = "put away" → header retreats; an event re-lights the
+     dimmed title itself (amber activity / red waiting, waiting wins) */
+  .window.collapsed .win-name  { color: var(--muted); }
+  .window.collapsed .win-index { color: var(--dim); }
+  .window.collapsed.is-busy    .win-name { color: var(--window); }
+  .window.collapsed.is-waiting .win-name { color: var(--waiting); }
+  .session.collapsed .session-name { color: var(--muted); }
+  .session.collapsed.is-busy    .session-name { color: var(--window); }
+  .session.collapsed.is-waiting .session-name { color: var(--waiting); }
 
   /* ── panes grid ── */
   .panes {
@@ -322,7 +332,6 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    margin-left: auto;
     font-size: 9px;
     font-weight: 600;
     letter-spacing: 0.3px;
@@ -399,7 +408,6 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    margin-left: auto;
     font-size: 9px;
     font-weight: 700;
     letter-spacing: 0.3px;
@@ -413,6 +421,9 @@
     animation: busy-pulse 1.1s ease-in-out infinite;
   }
   .window:not(.collapsed) .win-waiting { display: none; }
+  /* session-header rollups (.sess) only show when the session is folded */
+  .session:not(.collapsed) .win-waiting.sess,
+  .session:not(.collapsed) .win-activity.sess { display: none; }
 
   @keyframes busy-pulse {
     0%, 100% { opacity: 1; }
@@ -859,6 +870,7 @@ function render(data) {
 
     const isCurrentSess = sess.current;
     const isCollapsed   = collapsedSessions.has(sess.name);
+    let sessBusy = false, sessWaiting = false;
 
     const windowsHtml = sess.windows.map(win => {
       totalPanes += win.panes.length;
@@ -931,15 +943,19 @@ function render(data) {
         </div>`;
       }).join('');
 
-      return `<div class="window${isActiveWin ? ' is-active' : ''}${winBusy ? ' is-busy' : ''}${winCollapsed ? ' collapsed' : ''}"
+      if (winBusy) sessBusy = true;
+      if (winWaiting) sessWaiting = true;
+
+      return `<div class="window${isActiveWin ? ' is-active' : ''}${winBusy ? ' is-busy' : ''}${winWaiting ? ' is-waiting' : ''}${winCollapsed ? ' collapsed' : ''}"
                    data-wkey="${escHtml(wkey)}">
         <div class="window-header" onclick="toggleWindow('${escHtml(wkey)}')">
           <div class="win-indicator"></div>
           <div class="win-index">#${win.index}</div>
           <div class="win-name">${escHtml(win.name)}</div>
-          <div class="win-pane-count">${win.panes.length} pane${win.panes.length !== 1 ? 's' : ''}</div>
           ${winWaiting ? '<span class="win-waiting"><span class="act-dot"></span>⏸ waiting</span>'
                        : winBusy ? '<span class="win-activity"><span class="act-dot"></span>activity</span>' : ''}
+          <span class="win-spacer"></span>
+          <div class="win-pane-count">${win.panes.length} pane${win.panes.length !== 1 ? 's' : ''}</div>
           <div class="win-collapse-icon">▾</div>
         </div>
         <div class="panes">${panesHtml}</div>
@@ -952,11 +968,13 @@ function render(data) {
         ? '<span class="tag attached">attached</span>'
         : '<span class="tag detached">detached</span>';
 
-    return `<div class="session${isCurrentSess ? ' is-current' : ''}${isCollapsed ? ' collapsed' : ''}"
+    return `<div class="session${isCurrentSess ? ' is-current' : ''}${sessBusy ? ' is-busy' : ''}${sessWaiting ? ' is-waiting' : ''}${isCollapsed ? ' collapsed' : ''}"
                  data-session="${escHtml(sess.name)}">
       <div class="session-header" onclick="toggleSession('${escHtml(sess.name)}')">
         <span class="session-icon">▾</span>
         <span class="session-name">${escHtml(sess.name)}</span>
+        ${sessWaiting ? '<span class="win-waiting sess"><span class="act-dot"></span>⏸ waiting</span>'
+                      : sessBusy ? '<span class="win-activity sess"><span class="act-dot"></span>activity</span>' : ''}
         <span class="session-meta">${sess.window_count} win</span>
         ${tagHtml}
       </div>

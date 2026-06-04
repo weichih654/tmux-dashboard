@@ -996,6 +996,67 @@ class WaitingPaneStateTests(unittest.TestCase):
             self.assertTrue(p["waiting"])   # capture shows a live prompt
 
 
+class CollapsedHeaderTests(unittest.TestCase):
+    """Collapsed windows/sessions dim their headers; events re-light them."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(HTML, encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_collapsed_window_title_dimmed(self):
+        self.assertRegex(self.html,
+                         r"\.window\.collapsed\s+\.win-name\s*\{[^}]*--muted",
+                         "collapsed window title must dim to --muted")
+
+    def test_collapsed_session_title_dimmed(self):
+        self.assertRegex(self.html,
+                         r"\.session\.collapsed\s+\.session-name\s*\{[^}]*--muted",
+                         "collapsed session title must dim to --muted")
+
+    def test_collapsed_title_lights_up_on_events(self):
+        # The dimmed title itself takes the event color: amber for
+        # activity, red for waiting (waiting wins).
+        self.assertRegex(self.html,
+                         r"\.window\.collapsed\.is-busy\s+\.win-name\s*\{[^}]*--window",
+                         "collapsed busy window title must turn amber")
+        self.assertRegex(self.html,
+                         r"\.window\.collapsed\.is-waiting\s+\.win-name\s*\{[^}]*--waiting",
+                         "collapsed waiting window title must turn red")
+
+    def test_window_div_gets_waiting_class(self):
+        self.assertRegex(self.html, r"winWaiting\s*\?\s*' is-waiting'",
+                         "window div must carry is-waiting for CSS")
+
+    def test_rollup_badge_next_to_title_not_far_right(self):
+        # Badge sits right AFTER the title; a flex spacer pushes the
+        # pane-count/arrow to the right — so the eye finds the event beside
+        # the name, not at the far edge of the row.
+        m = re.search(r"\.win-activity\s*\{([^}]*)\}", self.html)
+        self.assertIsNotNone(m)
+        self.assertNotIn("margin-left: auto", m.group(1),
+                         "badge must not be pushed to the far right")
+        self.assertIn("win-spacer", self.html,
+                      "header needs a flex spacer after the badge")
+        # template order: win-name div, then the rollup badge, then spacer
+        self.assertRegex(self.html,
+                         re.compile(r"win-name.{0,200}winWaiting.{0,300}win-spacer",
+                                    re.DOTALL),
+                         "badge must render between title and spacer")
+
+    def test_session_header_rolls_up_events_when_collapsed(self):
+        # A collapsed SESSION hides its windows' badges entirely — the
+        # session header must roll up waiting/activity itself.
+        self.assertRegex(self.html, r"sessWaiting",
+                         "session-level waiting rollup missing")
+        self.assertRegex(self.html,
+                         r"\.session:not\(\.collapsed\)\s+\.(win-waiting|win-activity)",
+                         "session rollup badge must hide when expanded")
+        self.assertRegex(self.html,
+                         r"\.session\.collapsed\.is-waiting\s+\.session-name\s*\{[^}]*--waiting",
+                         "collapsed waiting session title must turn red")
+
+
 class PaneIdTests(unittest.TestCase):
     """Panes are keyed by tmux pane_id (%N — unique, never renumbered).
 
