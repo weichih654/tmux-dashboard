@@ -10,7 +10,9 @@ A live web dashboard for tmux. See every session, window, and pane at a glance �
 - **Pane previews** — last 5 lines of each pane, ANSI-stripped
 - **Pane zoom** — click any pane card to open a floating modal with 50 lines of live, auto-updating content; close with `ESC`, backdrop click, or `✕`
 - **Activity glow** — panes with new output light up amber, then fade back to normal slowly over 60 seconds; new activity instantly restores the glow
-- **Dual-mode activity detection** — uses tmux-native `pane_last_activity` when the running tmux supports it (detected automatically); otherwise falls back to content-hash comparison between polls
+- **Agent waiting detection** — when an AI agent (Claude Code, Codex, Copilot CLI, Opencode) or any CLI stops on a yes/no menu, permission dialog, or `(y/n)` prompt, the pane glows **red** with a `⏸ waiting` badge — and fires a **browser notification** so you notice even with the tab in the background
+- **Dual-mode activity detection** — uses tmux-native `pane_last_activity` when the running tmux supports it (detected automatically); otherwise falls back to content-hash comparison between polls — including the spinner/timer lines agents redraw while thinking
+- **No false alarms** — prompt patterns are anchored to real prompt line shapes (prose, logs, and `❯`-themed shell prompts don't trigger); pane create/remove/resize and content rewrap don't count as activity (panes are tracked by stable `pane_id`)
 - **HERE marker** — shows which pane your cursor actually sits in
 - **Pane titles** — custom titles (`select-pane -T`) shown as the main label, running command as a tag
 - **Collapsible** — fold sessions and windows you don't care about
@@ -68,11 +70,25 @@ To check what your tmux supports:
 tmux display-message -p '#{?#{pane_last_activity},YES,NO}'
 ```
 
+### Waiting detection
+
+Each pane's captured tail (last 8 non-empty lines, box-drawing borders stripped) is
+matched against prompt-shaped patterns: question lines (`Do you want to proceed?`,
+`Allow command?`), hint footers (`Enter to select`, `esc to cancel`,
+`Press Enter to confirm`), and generic `(y/n)` / `[Y/n]` tails. Only whole-line /
+anchored shapes count, so prose like "Tests pass. Should I continue?" or an answered
+menu's one-line echo won't keep a pane red. A waiting pane:
+
+- glows red with a `⏸ waiting` badge (overrides the amber activity glow)
+- rolls up to the window header when collapsed
+- fires one browser notification per waiting episode (deduped per pane; ask the
+  permission prompt once on first load)
+
 ## API
 
 | Endpoint                  | Response                                              |
 |---------------------------|-------------------------------------------------------|
-| `GET /api/tmux`           | full state: sessions / windows / panes + previews + `activity_source` |
+| `GET /api/tmux`           | full state: sessions / windows / panes + previews + `waiting` / `content_hash` / `id` per pane + `activity_source` |
 | `GET /api/pane?target=S:W.P` | `{"lines": [...]}` — last 50 non-empty lines of that pane |
 
 ## Tests
