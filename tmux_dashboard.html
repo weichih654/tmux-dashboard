@@ -304,30 +304,17 @@
   }
   .pane:hover { background: #1e2330; border-color: var(--border2); }
 
+  /* focused pane of a window — subtle background tint ONLY, a lighter
+     shade of the base palette (lightness, not hue). No accent bar /
+     border override: those clash with the amber/red glow rings
+     (green left edge + amber other edges looked broken). */
   .pane.is-active {
-    background: rgba(80, 216, 144, 0.05);
-    border-color: rgba(80,216,144,0.22);
+    background: #21262c;
   }
+  /* current pane = where your cursor actually is — slightly lighter
+     again; the ▸ HERE badge carries the rest of the meaning */
   .pane.is-current {
-    background: rgba(80, 216, 144, 0.10);
-    border-color: rgba(80,216,144,0.35);
-  }
-
-  /* active accent — rounded inset bar (plays nice with the pane radius) */
-  .pane.is-active::before {
-    content: '';
-    position: absolute;
-    left: 0; top: 9px; bottom: 9px;
-    width: 3px;
-    border-radius: 0 3px 3px 0;
-    background: var(--active);
-  }
-
-  /* current pane = where your cursor actually is — stronger, glowing bar */
-  .pane.is-current::before {
-    width: 4px;
-    background: var(--active);
-    box-shadow: 0 0 9px rgba(61,214,140,0.65);
+    background: #293039;
   }
 
   /* activity indicator in the window header */
@@ -353,7 +340,7 @@
   .window:not(.collapsed) .win-activity { display: none; }
   /* busy = new output detected since last fetch — glow on the pane itself */
   .pane.is-busy {
-    background: rgba(230, 169, 74, 0.07);
+    background: rgba(230, 169, 74, 0.13);
     border-color: rgba(230,169,74,0.5);
     z-index: 2;
     animation: activity-breathe 1.6s ease-in-out infinite;
@@ -362,7 +349,7 @@
   /* fading = activity stopped; slow 60-second fade back to normal */
   @keyframes busy-fade-out {
     from {
-      background: rgba(230, 169, 74, 0.07);
+      background: rgba(230, 169, 74, 0.13);
       border-color: rgba(230,169,74,0.5);
       box-shadow: inset 0 0 0 1px rgba(230,169,74,0.55), 0 0 11px rgba(230,169,74,0.14);
     }
@@ -383,7 +370,7 @@
     50%      { box-shadow: inset 0 0 0 1px rgba(240,96,90,0.95), 0 0 22px rgba(240,96,90,0.38); }
   }
   .pane.is-waiting {
-    background: rgba(240, 96, 90, 0.07);
+    background: rgba(240, 96, 90, 0.13);
     border-color: rgba(240,96,90,0.55);
     z-index: 2;
     animation: waiting-breathe 1.3s ease-in-out infinite;
@@ -769,10 +756,16 @@ function notifyWaiting(key, label) {
 //   'hash' — compare preview content between polls. Fallback for older tmux.
 const BUSY_TTL      = 8000;   // ms of active glow after last activity
 const FADE_DURATION = 60000;  // ms for the slow fade-out (1 minute)
+const BIRTH_GRACE   = 5000;   // ms after first sighting where hash changes
+                              // don't glow — a new pane drawing its shell
+                              // prompt is not "activity"
 let   activitySource = 'hash'; // set from server response; safe default
 const prevHash    = new Map(); // key → last content hash   (hash mode)
 const lastChanged = new Map(); // key → timestamp of last change (hash mode)
 const fadeStart   = new Map(); // key → timestamp when fade-out began (hash mode)
+const prevSize    = new Map(); // key → last pane size — a size change means
+                               // the content REWRAPPED (split/resize), not output
+const paneBirth   = new Map(); // key → timestamp the key was first seen
 
 function simpleHash(str) {
   let h = 0;
@@ -806,9 +799,17 @@ function checkBusy(key, pane) {
   // ticking ABOVE the static status bar that fills the 5-line preview.
   // Old servers without the field → hash the preview as before.
   const hash = pane.content_hash || simpleHash(pane.preview.join('\n'));
+  if (!paneBirth.has(key)) paneBirth.set(key, now);
+  // a size change means the content REWRAPPED (split / resize) — the hash
+  // moves with no real output, so that poll must not count as activity
+  const sizeChanged = prevSize.get(key) !== pane.size;
+  prevSize.set(key, pane.size);
   if (prevHash.has(key) && prevHash.get(key) !== hash) {
-    lastChanged.set(key, now);
-    fadeStart.delete(key);   // new activity cancels any in-progress fade
+    const inBirthGrace = (now - paneBirth.get(key)) < BIRTH_GRACE;
+    if (!sizeChanged && !inBirthGrace) {
+      lastChanged.set(key, now);
+      fadeStart.delete(key);   // new activity cancels any in-progress fade
+    }
   }
   prevHash.set(key, hash);
 
@@ -869,7 +870,9 @@ function render(data) {
       let winWaiting = false;
 
       const panesHtml = win.panes.map(pane => {
-        const key = paneKey(sess.name, win.index, pane.index);
+        // key by tmux pane_id (%N — unique, survives index renumbering when
+        // a sibling is killed); composite key only for old servers / demo
+        const key = pane.id || paneKey(sess.name, win.index, pane.index);
         seenKeys.add(key);
         const { state: busyState, fadeElapsed } = checkBusy(key, pane);
         const isWaiting = !!pane.waiting;
@@ -966,6 +969,18 @@ function render(data) {
   // reap dedupe entries for panes that vanished (closed while waiting)
   for (const k of notifiedWaiting) {
     if (!seenKeys.has(k)) notifiedWaiting.delete(k);
+  }
+  // reap hash-mode state for vanished panes — tmux reuses pane indexes,
+  // and a stale hash under the same key makes a freshly split pane glow
+  // "activity" at birth (compared against the dead pane's content).
+  for (const k of [...prevHash.keys()]) {
+    if (!seenKeys.has(k)) {
+      prevHash.delete(k);
+      lastChanged.delete(k);
+      fadeStart.delete(k);
+      prevSize.delete(k);
+      paneBirth.delete(k);
+    }
   }
 
   // stats

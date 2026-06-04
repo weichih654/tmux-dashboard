@@ -209,20 +209,23 @@ def parse_pane_fields(line, host, with_activity=False):
     # Field order MUST match the list-panes -F format below. pane_title is
     # user-controlled and may itself contain the '|' delimiter, so it is the
     # LAST field and we split with a maxsplit that keeps it intact.
-    # When with_activity is True, pane_last_activity (epoch seconds) is the
-    # 7th field, before pane_title.
+    # pane_id (%N — unique, never renumbered) sits right before the title;
+    # the frontend keys its per-pane state on it because pane INDEXES get
+    # renumbered when a sibling is killed. When with_activity is True,
+    # pane_last_activity (epoch seconds) comes before pane_id.
     last_activity = 0
     if with_activity:
+        parts = line.split("|", 8)
+        if len(parts) < 9:
+            return None
+        (pidx, pactive, pcmd, ppath, pwidth, pheight,
+         plastact, pid, ptitle) = parts
+        last_activity = int(plastact) if plastact.isdigit() else 0
+    else:
         parts = line.split("|", 7)
         if len(parts) < 8:
             return None
-        pidx, pactive, pcmd, ppath, pwidth, pheight, plastact, ptitle = parts
-        last_activity = int(plastact) if plastact.isdigit() else 0
-    else:
-        parts = line.split("|", 6)
-        if len(parts) < 7:
-            return None
-        pidx, pactive, pcmd, ppath, pwidth, pheight, ptitle = parts
+        pidx, pactive, pcmd, ppath, pwidth, pheight, pid, ptitle = parts
     # default pane_title is the hostname — treat that as "no custom title"
     # so we fall back to the running command in the UI.
     title = ptitle if (ptitle and ptitle != host) else ""
@@ -234,6 +237,7 @@ def parse_pane_fields(line, host, with_activity=False):
         "width": pwidth,
         "height": pheight,
         "last_activity": last_activity,
+        "id": pid,
         "title": title,
     }
 
@@ -253,10 +257,10 @@ def get_tmux_state():
     use_activity = tmux_supports_pane_last_activity()
     pane_fmt = (
         "#{pane_index}|#{pane_active}|#{pane_current_command}|#{pane_current_path}"
-        "|#{pane_width}|#{pane_height}|#{pane_last_activity}|#{pane_title}"
+        "|#{pane_width}|#{pane_height}|#{pane_last_activity}|#{pane_id}|#{pane_title}"
         if use_activity else
         "#{pane_index}|#{pane_active}|#{pane_current_command}|#{pane_current_path}"
-        "|#{pane_width}|#{pane_height}|#{pane_title}"
+        "|#{pane_width}|#{pane_height}|#{pane_id}|#{pane_title}"
     )
 
     sessions = []
@@ -303,6 +307,7 @@ def get_tmux_state():
 
                 pane = {
                     "index": pidx,
+                    "id": f["id"],
                     "active": pactive == "1",
                     "current": is_current,
                     "command": pcmd,

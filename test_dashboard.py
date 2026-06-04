@@ -102,19 +102,19 @@ class PreviewTests(unittest.TestCase):
 
 class PaneTitleTests(unittest.TestCase):
     def test_parses_custom_title(self):
-        d = srv.parse_pane_fields("0|1|nvim|/Users/x|96|42|edit-config", host="mac")
+        d = srv.parse_pane_fields("0|1|nvim|/Users/x|96|42|%1|edit-config", host="mac")
         self.assertEqual(d["command"], "nvim")
         self.assertEqual(d["title"], "edit-config")
 
     def test_blank_title_when_equals_host(self):
         # default pane_title is the hostname — treat as "no custom title".
-        d = srv.parse_pane_fields("0|1|nvim|/Users/x|96|42|mac", host="mac")
+        d = srv.parse_pane_fields("0|1|nvim|/Users/x|96|42|%1|mac", host="mac")
         self.assertEqual(d["title"], "")
 
     def test_title_with_pipes_preserved(self):
         # pane_title is user-controlled and may contain our '|' delimiter;
         # it is the last field so the rest must stay intact.
-        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|a|b|c", host="h")
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|%1|a|b|c", host="h")
         self.assertEqual(d["title"], "a|b|c")
         self.assertEqual(d["command"], "nvim")
         self.assertEqual(d["width"], "96")
@@ -180,7 +180,7 @@ class ActivitySourceBackendTests(unittest.TestCase):
                                 "must re-probe after a negative result")
 
     def test_parse_with_activity_8_fields(self):
-        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|1735000000|title",
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|1735000000|%2|title",
                                   host="h", with_activity=True)
         self.assertIsNotNone(d)
         self.assertEqual(d["last_activity"], 1735000000)
@@ -189,24 +189,24 @@ class ActivitySourceBackendTests(unittest.TestCase):
 
     def test_parse_with_activity_title_pipes_preserved(self):
         # pane_title stays LAST so embedded pipes survive even with activity field.
-        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|1735000000|a|b|c",
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|1735000000|%2|a|b|c",
                                   host="h", with_activity=True)
         self.assertEqual(d["title"], "a|b|c")
         self.assertEqual(d["last_activity"], 1735000000)
 
     def test_parse_with_activity_short_rejected(self):
         # 7 fields when 8 are expected (activity mode) must be rejected.
-        self.assertIsNone(srv.parse_pane_fields("0|1|nvim|/p|96|42|title",
+        self.assertIsNone(srv.parse_pane_fields("0|1|nvim|/p|96|42|%2|title",
                                                 host="h", with_activity=True))
 
     def test_parse_with_activity_zero_on_non_numeric(self):
-        d = srv.parse_pane_fields("0|1|nvim|/p|96|42||title",
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42||%2|title",
                                   host="h", with_activity=True)
         self.assertEqual(d["last_activity"], 0)
 
     def test_parse_without_activity_defaults_zero(self):
         # Hash-mode (7 fields) still works; last_activity defaults to 0.
-        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|title", host="h")
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|%1|title", host="h")
         self.assertIsNotNone(d)
         self.assertEqual(d.get("last_activity", 0), 0)
 
@@ -964,8 +964,8 @@ class WaitingPaneStateTests(unittest.TestCase):
             if "list-windows" in cmd:
                 return "0|sh|1|2|layout"
             if "list-panes" in cmd:
-                return ("0|1|zsh|/tmp|80|24|t1\n"
-                        "1|0|claude|/tmp|80|24|t2")
+                return ("0|1|zsh|/tmp|80|24|%10|t1\n"
+                        "1|0|claude|/tmp|80|24|%11|t2")
             if "capture-pane" in cmd:
                 return "Do you want to proceed?\n❯ 1. Yes"
             if "pane_last_activity" in cmd:
@@ -994,6 +994,41 @@ class WaitingPaneStateTests(unittest.TestCase):
             self.assertIn("waiting", p)
             self.assertIsInstance(p["waiting"], bool)
             self.assertTrue(p["waiting"])   # capture shows a live prompt
+
+
+class PaneIdTests(unittest.TestCase):
+    """Panes are keyed by tmux pane_id (%N — unique, never renumbered).
+
+    Killing a pane renumbers the survivors' indexes, so an index-composed
+    key suddenly points at a DIFFERENT pane's stale hash → false activity.
+    """
+
+    def test_parse_includes_pane_id(self):
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|%7|mytitle", host="h")
+        self.assertIsNotNone(d)
+        self.assertEqual(d["id"], "%7")
+        self.assertEqual(d["title"], "mytitle")
+
+    def test_parse_includes_pane_id_with_activity(self):
+        d = srv.parse_pane_fields("0|1|nvim|/p|96|42|1735000000|%7|t",
+                                  host="h", with_activity=True)
+        self.assertIsNotNone(d)
+        self.assertEqual(d["id"], "%7")
+        self.assertEqual(d["last_activity"], 1735000000)
+
+    def test_pane_fmt_requests_pane_id(self):
+        import inspect
+        src = inspect.getsource(srv.get_tmux_state)
+        self.assertIn("#{pane_id}", src,
+                      "list-panes format must request #{pane_id}")
+        self.assertIn('"id"', src,
+                      "pane JSON must carry the id")
+
+    def test_frontend_keys_by_pane_id(self):
+        with open(HTML, encoding="utf-8") as f:
+            html = f.read()
+        self.assertRegex(html, r"pane\.id\s*\|\|\s*paneKey",
+                         "render must key by pane.id, composite key only as fallback")
 
 
 class WaitingFrontendTests(unittest.TestCase):
@@ -1049,12 +1084,84 @@ class WaitingFrontendTests(unittest.TestCase):
         self.assertIn("在等你回覆", self.html,
                       "notification body must say the pane is waiting")
 
+    def test_active_pane_uses_background_not_border(self):
+        # The focused pane of a window must be marked by a subtle background
+        # tint only — accent bars/borders clash with the amber/red glow
+        # rings (green left edge + amber other edges looked broken).
+        self.assertNotIn(".pane.is-active::before", self.html,
+                         "is-active must not draw an accent bar")
+        self.assertNotIn(".pane.is-current::before", self.html,
+                         "is-current must not draw an accent bar")
+        # no border-color override inside the is-active / is-current rules,
+        # and the tint must be a NEUTRAL shade of the base palette (no green
+        # hue — user feedback), distinguished by lightness only.
+        for cls in (".pane.is-active", ".pane.is-current"):
+            m = re.search(re.escape(cls) + r"\s*\{([^}]*)\}", self.html)
+            self.assertIsNotNone(m, f"{cls} rule missing")
+            self.assertNotIn("border-color", m.group(1),
+                             f"{cls} must not override border-color")
+            self.assertIn("background", m.group(1),
+                          f"{cls} must distinguish via background tint")
+            self.assertNotIn("216", m.group(1),
+                             f"{cls} must not use the green accent color")
+
     def test_demo_mode_has_waiting_pane(self):
         # Demo data must include a simulated waiting pane for preview.
         self.assertRegex(self.html, r"waiting:\s*true",
                          "makeDemoData must include a waiting pane")
 
     # ── fixes from review round 1 ───────────────────────────
+
+    def test_hash_maps_reaped_for_vanished_panes(self):
+        # prevHash/lastChanged/fadeStart entries for killed panes must be
+        # reaped — tmux reuses pane indexes, so a stale hash under the same
+        # key makes a NEWLY split pane glow "activity" at birth (compared
+        # against the dead pane's content).
+        self.assertRegex(self.html, r"prevHash\.delete\(",
+                         "stale prevHash entries must be reaped")
+        # the reap must cover all three hash-mode maps in one sweep
+        m = re.search(
+            r"for\s*\(const k of \[\.\.\.prevHash\.keys\(\)\]\)(.{0,300})",
+            self.html, re.DOTALL)
+        self.assertIsNotNone(m, "reap loop over prevHash.keys() missing")
+        block = m.group(1)
+        self.assertIn("!seenKeys.has(k)", block)
+        self.assertIn("prevHash.delete(k)", block)
+        self.assertIn("lastChanged.delete(k)", block)
+        self.assertIn("fadeStart.delete(k)", block)
+
+    def test_resize_rewrap_not_treated_as_activity(self):
+        # Splitting a window resizes the sibling pane → content rewraps →
+        # capture hash changes with NO real output. The poll where a pane's
+        # size changed must not mark it busy.
+        self.assertRegex(self.html, r"prevSize\s*=\s*new Map",
+                         "must track pane size between polls")
+        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
+                      re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(m, "checkBusy not found")
+        body = m.group(1)
+        self.assertIn("pane.size", body,
+                      "checkBusy must compare pane.size to suppress rewrap noise")
+
+    def test_new_pane_birth_grace_period(self):
+        # A freshly created pane draws its shell prompt over the first
+        # seconds — that must not glow. Grace period after first sighting.
+        self.assertRegex(self.html, r"paneBirth\s*=\s*new Map",
+                         "must record when a pane key was first seen")
+        m = re.search(r"BIRTH_GRACE\s*=\s*(\d+)", self.html)
+        self.assertIsNotNone(m, "BIRTH_GRACE constant missing")
+        self.assertGreaterEqual(int(m.group(1)), 3000)
+        self.assertLessEqual(int(m.group(1)), 15000)
+
+    def test_size_and_birth_maps_reaped(self):
+        # The vanished-pane reap sweep must cover the new maps too, or
+        # index reuse resurrects stale sizes/birth times.
+        m = re.search(
+            r"for\s*\(const k of \[\.\.\.prevHash\.keys\(\)\]\)(.{0,400})",
+            self.html, re.DOTALL)
+        self.assertIsNotNone(m, "reap loop over prevHash.keys() missing")
+        self.assertIn("prevSize.delete(k)", m.group(1))
+        self.assertIn("paneBirth.delete(k)", m.group(1))
 
     def test_notified_set_reaped_for_vanished_panes(self):
         # A pane killed WHILE waiting never hits the !isWaiting branch, so
