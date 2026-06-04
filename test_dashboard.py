@@ -1066,6 +1066,14 @@ class DonePendingTests(unittest.TestCase):
         self.assertRegex(self.html, r"MIN_JOB_MS",
                          "completion must require the minimum job duration")
 
+    def test_focus_during_quiet_window_cancels_verdict(self):
+        # Watching the job end and switching away within the 30s quiet
+        # window counts as "seen" — the pending verdict must be cancelled,
+        # not delivered as a green frame later.
+        self.assertRegex(self.html,
+                         r"jobStart\.has\(key\)\s*&&\s*pane\.current",
+                         "focus during the quiet window must cancel the verdict")
+
     def test_focus_clears_done(self):
         # HERE pane (current) clears/never receives the green frame
         self.assertRegex(self.html, r"pane\.current.{0,80}donePending\.delete|donePending\.delete\(key\)",

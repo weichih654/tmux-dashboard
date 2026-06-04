@@ -911,6 +911,10 @@ function render(data) {
         if (busyState === 'busy') {
           if (!jobStart.has(key)) jobStart.set(key, nowTs);
           donePending.delete(key);   // it's running again — not done
+        } else if (jobStart.has(key) && pane.current) {
+          // focused during the quiet window = saw it finish — cancel the
+          // pending verdict instead of delivering a green frame later
+          jobStart.delete(key);
         } else if (jobStart.has(key) && lastTs &&
                    (nowTs - lastTs) >= DONE_QUIET_MS) {
           if ((lastTs - jobStart.get(key)) >= MIN_JOB_MS && !pane.current) {
