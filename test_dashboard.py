@@ -1057,6 +1057,54 @@ class CollapsedHeaderTests(unittest.TestCase):
                          "session rollup badge must hide when expanded")
 
 
+class AutoFoldTests(unittest.TestCase):
+    """Windows with no events for AUTO_FOLD_AFTER auto-collapse."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(HTML, encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_auto_fold_constant(self):
+        m = re.search(r"AUTO_FOLD_AFTER\s*=\s*(\d+)", self.html)
+        self.assertIsNotNone(m, "AUTO_FOLD_AFTER constant missing")
+        self.assertEqual(int(m.group(1)), 180000, "spec says 3 minutes")
+
+    def test_event_times_tracked_per_window(self):
+        self.assertRegex(self.html, r"winLastEvent\s*=\s*new Map",
+                         "must track last event time per window")
+
+    def test_first_sighting_is_baseline(self):
+        # Page load must not fold everything instantly — a window first
+        # seen now has its baseline set to now.
+        self.assertRegex(self.html, r"!winLastEvent\.has\(wkey\)",
+                         "first sighting must seed the event baseline")
+
+    def test_manual_expand_exempts_until_next_event(self):
+        self.assertRegex(self.html, r"manualExpand\s*=\s*new Set",
+                         "manual-expand exemption set missing")
+        # expanding via toggleWindow must register the exemption
+        m = re.search(r"function toggleWindow\((.*?)^}", self.html,
+                      re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(m)
+        self.assertIn("manualExpand.add", m.group(0),
+                      "manual expand must exempt the window from auto-fold")
+        # a new event re-arms auto-fold (clears the exemption)
+        self.assertRegex(self.html, r"manualExpand\.delete\(wkey\)",
+                         "events must clear the manual-expand exemption")
+
+    def test_here_window_never_auto_folds(self):
+        # The window containing the cursor (HERE pane) must be exempt.
+        self.assertRegex(self.html, r"hasCurrent",
+                         "auto-fold must check for the current (HERE) pane")
+
+    def test_window_state_maps_pruned(self):
+        # Vanished windows must not leak entries (index reuse would
+        # resurrect stale fold/exemption state).
+        self.assertRegex(self.html, r"winLastEvent\.delete\(",
+                         "winLastEvent must be pruned for vanished windows")
+
+
 class PaneIdTests(unittest.TestCase):
     """Panes are keyed by tmux pane_id (%N — unique, never renumbered).
 

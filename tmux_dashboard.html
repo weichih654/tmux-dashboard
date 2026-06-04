@@ -725,6 +725,15 @@ slider.addEventListener('input', () => {
 const collapsedSessions = new Set();
 const collapsedWindows  = new Set();
 
+// ── auto-fold ──────────────────────────────────────────────
+// A window with no events (activity / waiting) for AUTO_FOLD_AFTER ms
+// folds itself. The window holding the cursor (HERE pane) is exempt, and
+// a manually expanded window stays open until its NEXT event re-arms the
+// timer. First sighting seeds the baseline so page load folds nothing.
+const AUTO_FOLD_AFTER = 180000;   // 3 minutes
+const winLastEvent  = new Map();  // wkey → timestamp of last event
+const manualExpand  = new Set();  // wkey → user opened it; auto-fold backs off
+
 // ── waiting notification ───────────────────────────────────
 // Browser notification when a pane transitions not-waiting → waiting.
 // Deduped per pane: silent while the pane KEEPS waiting, re-armed once it
@@ -861,6 +870,8 @@ function render(data) {
   // against this set after the loop (else pane-index reuse would suppress
   // a future real notification).
   const seenKeys = new Set();
+  const seenWkeys = new Set();
+  const nowTs = Date.now();
 
   const html = data.sessions.map(sess => {
     totalWindows += sess.window_count;
@@ -873,7 +884,7 @@ function render(data) {
       totalPanes += win.panes.length;
 
       const wkey = sess.name + ':' + win.index;
-      const winCollapsed = collapsedWindows.has(wkey);
+      seenWkeys.add(wkey);
       const isActiveWin  = win.active;
       let winBusy = false;
       let winWaiting = false;
@@ -943,6 +954,20 @@ function render(data) {
       if (winBusy) sessBusy = true;
       if (winWaiting) sessWaiting = true;
 
+      // auto-fold bookkeeping — events refresh the clock and re-arm the
+      // manual-expand exemption; quiet windows fold after the timeout
+      const hasCurrent = win.panes.some(p => p.current);
+      if (!winLastEvent.has(wkey)) winLastEvent.set(wkey, nowTs);
+      if (winBusy || winWaiting) {
+        winLastEvent.set(wkey, nowTs);
+        manualExpand.delete(wkey);
+      }
+      if (!hasCurrent && !manualExpand.has(wkey) &&
+          nowTs - winLastEvent.get(wkey) > AUTO_FOLD_AFTER) {
+        collapsedWindows.add(wkey);
+      }
+      const winCollapsed = collapsedWindows.has(wkey);
+
       return `<div class="window${isActiveWin ? ' is-active' : ''}${winBusy ? ' is-busy' : ''}${winWaiting ? ' is-waiting' : ''}${winCollapsed ? ' collapsed' : ''}"
                    data-wkey="${escHtml(wkey)}">
         <div class="window-header" onclick="toggleWindow('${escHtml(wkey)}')">
@@ -997,6 +1022,15 @@ function render(data) {
       paneBirth.delete(k);
     }
   }
+  // prune window-keyed state too — a recreated window reusing the index
+  // must not inherit stale fold/exemption/event state
+  for (const k of [...winLastEvent.keys()]) {
+    if (!seenWkeys.has(k)) {
+      winLastEvent.delete(k);
+      manualExpand.delete(k);
+      collapsedWindows.delete(k);
+    }
+  }
 
   // stats
   document.getElementById('session-count').textContent =
@@ -1017,8 +1051,13 @@ function toggleSession(name) {
 }
 
 function toggleWindow(wkey) {
-  if (collapsedWindows.has(wkey)) collapsedWindows.delete(wkey);
-  else collapsedWindows.add(wkey);
+  if (collapsedWindows.has(wkey)) {
+    collapsedWindows.delete(wkey);
+    manualExpand.add(wkey);     // user wants it open — auto-fold backs off
+  } else {
+    collapsedWindows.add(wkey);
+    manualExpand.delete(wkey);
+  }
   const el = document.querySelector(`.window[data-wkey="${wkey}"]`);
   if (el) el.classList.toggle('collapsed');
 }
