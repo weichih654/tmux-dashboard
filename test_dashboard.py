@@ -1014,15 +1014,18 @@ class CollapsedHeaderTests(unittest.TestCase):
                          r"\.session\.collapsed\s+\.session-name\s*\{[^}]*--muted",
                          "collapsed session title must dim to --muted")
 
-    def test_collapsed_title_lights_up_on_events(self):
-        # The dimmed title itself takes the event color: amber for
-        # activity, red for waiting (waiting wins).
-        self.assertRegex(self.html,
-                         r"\.window\.collapsed\.is-busy\s+\.win-name\s*\{[^}]*--window",
-                         "collapsed busy window title must turn amber")
-        self.assertRegex(self.html,
-                         r"\.window\.collapsed\.is-waiting\s+\.win-name\s*\{[^}]*--waiting",
-                         "collapsed waiting window title must turn red")
+    def test_collapsed_title_stays_dim_even_with_events(self):
+        # The badge beside the title signals events; the title itself must
+        # stay dim — re-coloring it made collapsed state unreadable again.
+        self.assertNotRegex(self.html,
+                            r"\.window\.collapsed\.is-busy\s+\.win-name",
+                            "collapsed busy window title must NOT change color")
+        self.assertNotRegex(self.html,
+                            r"\.window\.collapsed\.is-waiting\s+\.win-name",
+                            "collapsed waiting window title must NOT change color")
+        self.assertNotRegex(self.html,
+                            r"\.session\.collapsed\.is-(busy|waiting)\s+\.session-name",
+                            "collapsed session title must NOT change color")
 
     def test_window_div_gets_waiting_class(self):
         self.assertRegex(self.html, r"winWaiting\s*\?\s*' is-waiting'",
@@ -1052,9 +1055,6 @@ class CollapsedHeaderTests(unittest.TestCase):
         self.assertRegex(self.html,
                          r"\.session:not\(\.collapsed\)\s+\.(win-waiting|win-activity)",
                          "session rollup badge must hide when expanded")
-        self.assertRegex(self.html,
-                         r"\.session\.collapsed\.is-waiting\s+\.session-name\s*\{[^}]*--waiting",
-                         "collapsed waiting session title must turn red")
 
 
 class PaneIdTests(unittest.TestCase):

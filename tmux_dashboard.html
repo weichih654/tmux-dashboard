@@ -283,15 +283,12 @@
   }
   .window.collapsed .win-collapse-icon { transform: rotate(-90deg); }
 
-  /* collapsed = "put away" → header retreats; an event re-lights the
-     dimmed title itself (amber activity / red waiting, waiting wins) */
+  /* collapsed = "put away" → header retreats. The title stays dim even
+     when events occur — the badge right beside it carries that signal;
+     re-coloring the title would make collapsed state unreadable again. */
   .window.collapsed .win-name  { color: var(--muted); }
   .window.collapsed .win-index { color: var(--dim); }
-  .window.collapsed.is-busy    .win-name { color: var(--window); }
-  .window.collapsed.is-waiting .win-name { color: var(--waiting); }
   .session.collapsed .session-name { color: var(--muted); }
-  .session.collapsed.is-busy    .session-name { color: var(--window); }
-  .session.collapsed.is-waiting .session-name { color: var(--waiting); }
 
   /* ── panes grid ── */
   .panes {
