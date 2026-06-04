@@ -11,7 +11,9 @@ A live web dashboard for tmux. See every session, window, and pane at a glance �
 - **Live overview** — all sessions → windows → panes rendered as cards, auto-refreshing (1–10s, adjustable)
 - **Pane previews** — last 5 lines of each pane, ANSI-stripped
 - **Pane zoom** — click any pane card to open a floating modal with 50 lines of live, auto-updating content; close with `ESC`, backdrop click, or `✕`
-- **Activity glow** — panes with new output light up amber, then fade back to normal slowly over 60 seconds; new activity instantly restores the glow
+- **Activity glow** — panes with output light up amber and stay lit until 30 s of silence, then hand off to the done verdict
+- **Done frame** — a job that ran ≥ 30 s and finished while you weren't looking gets a calm green frame + `✓ done` badge, sticky until you focus the pane in tmux or open its zoom — silently completed work doesn't get missed
+- **Auto-fold** — windows quiet for 3 minutes collapse themselves; the cursor's window, manually expanded windows, and windows holding an unseen done frame are exempt
 - **Agent waiting detection** — when an AI agent (Claude Code, Codex, Copilot CLI, Opencode) or any CLI stops on a yes/no menu, permission dialog, or `(y/n)` prompt, the pane glows **red** with a `⏸ waiting` badge — and fires a **browser notification** so you notice even with the tab in the background
 - **Dual-mode activity detection** — uses tmux-native `pane_last_activity` when the running tmux supports it (detected automatically); otherwise falls back to content-hash comparison between polls — including the spinner/timer lines agents redraw while thinking
 - **No false alarms** — prompt patterns are anchored to real prompt line shapes (prose, logs, and `❯`-themed shell prompts don't trigger); pane create/remove/resize and content rewrap don't count as activity (panes are tracked by stable `pane_id`)
