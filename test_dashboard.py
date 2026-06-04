@@ -430,85 +430,6 @@ class ZoomFrontendTests(unittest.TestCase):
 import shlex  # needed by ZoomBackendTests.test_fetch_zoom_capture_cmd_quotes_dangerous_target
 
 
-class FadeOutTests(unittest.TestCase):
-    """Tests for the slow busy-fade-out feature (hash-comparison based)."""
-
-    @classmethod
-    def setUpClass(cls):
-        with open(HTML, encoding="utf-8") as f:
-            cls.html = f.read()
-
-    def test_fade_duration_constant_exists(self):
-        self.assertIn("FADE_DURATION", self.html,
-                      "FADE_DURATION constant missing")
-
-    def test_fade_duration_at_least_60s(self):
-        m = re.search(r"FADE_DURATION\s*=\s*(\d+)", self.html)
-        self.assertIsNotNone(m, "FADE_DURATION not assigned a value")
-        self.assertGreaterEqual(int(m.group(1)), 60000,
-                                "FADE_DURATION must be >= 60000 ms (1 minute)")
-
-    def test_fade_start_map_declared(self):
-        # fadeStart Map tracks when each pane began fading out.
-        self.assertRegex(self.html, r"fadeStart\s*=\s*new Map",
-                         "fadeStart Map missing")
-
-    def test_busy_fade_out_keyframes_defined(self):
-        # CSS animation for the slow fade.
-        self.assertIn("busy-fade-out", self.html,
-                      "@keyframes busy-fade-out missing from CSS")
-
-    def test_is_fading_css_class_defined(self):
-        self.assertIn("is-fading", self.html,
-                      ".pane.is-fading CSS class missing")
-
-    def test_is_fading_uses_fade_out_animation(self):
-        # The CSS class must reference the fade-out keyframes (may span lines).
-        self.assertRegex(self.html,
-                         re.compile(r"is-fading.*busy-fade-out|busy-fade-out.*is-fading",
-                                    re.DOTALL),
-                         "is-fading class must use busy-fade-out animation")
-
-    def test_negative_animation_delay_applied_for_fading(self):
-        # Negative animation-delay is the trick that correctly positions the
-        # animation at the right point after DOM reconstruction each render cycle.
-        self.assertIn("animation-delay", self.html,
-                      "animation-delay must be applied for fading panes")
-
-    def test_fade_start_deleted_when_fade_completes(self):
-        # Must clean up fadeStart to avoid memory growth over time.
-        self.assertRegex(self.html, r"fadeStart\.delete\(",
-                         "fadeStart must be deleted when fade completes")
-
-    def test_fade_cancelled_on_new_activity(self):
-        # If a fading pane gets new output, it must return to full busy state.
-        # fadeStart must be cleared on hash change.
-        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
-                      re.DOTALL | re.MULTILINE)
-        self.assertIsNotNone(m, "checkBusy function not found")
-        body = m.group(1)
-        self.assertIn("fadeStart.delete", body,
-                      "checkBusy must cancel fade on new activity")
-
-    def test_checkbusy_has_fading_state(self):
-        # checkBusy must distinguish 'fading' from plain busy/not-busy.
-        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
-                      re.DOTALL | re.MULTILINE)
-        self.assertIsNotNone(m, "checkBusy not found")
-        self.assertIn("fading", m.group(1),
-                      "checkBusy must return/emit a fading state")
-
-    def test_pane_render_uses_is_fading_class(self):
-        # The pane HTML template must conditionally add is-fading class.
-        self.assertRegex(self.html, r"is-fading",
-                         "render must apply is-fading class to fading panes")
-
-    def test_window_busy_badge_not_shown_during_fade(self):
-        # Window-level activity badge should only pulse for actively busy
-        # panes, not for panes that are just slowly fading out.
-        self.assertRegex(self.html, r"isBusy.*winBusy|winBusy.*isBusy",
-                         "winBusy must only activate on isBusy, not on fading")
-
 
 class ActivitySourceFrontendTests(unittest.TestCase):
     """Tests for the frontend dual-mode (tmux pane_last_activity vs hash)."""
@@ -548,15 +469,6 @@ class ActivitySourceFrontendTests(unittest.TestCase):
                       re.DOTALL | re.MULTILINE)
         self.assertIn("simpleHash", m.group(1),
                       "checkBusy hash branch must still call simpleHash")
-
-    def test_checkbusy_returns_state_and_fade_elapsed(self):
-        # checkBusy returns an object exposing both the state and the fade
-        # elapsed time so render need not branch on mode for animation-delay.
-        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
-                      re.DOTALL | re.MULTILINE)
-        body = m.group(1)
-        self.assertIn("fadeElapsed", body,
-                      "checkBusy must return fadeElapsed for animation-delay")
 
 
 class WaitingDetectionTests(unittest.TestCase):
@@ -1187,6 +1099,25 @@ class DonePendingTests(unittest.TestCase):
         self.assertIn("win-done", self.html,
                       "collapsed window/session must roll up the done state")
 
+    def test_fade_machinery_removed(self):
+        # activity holds amber until the done verdict — the old 60s fade
+        # is gone entirely.
+        self.assertNotIn("FADE_DURATION", self.html)
+        self.assertNotIn("is-fading", self.html)
+        self.assertNotIn("fadeStart", self.html)
+        self.assertNotIn("busy-fade-out", self.html)
+
+    def test_busy_holds_until_done_verdict(self):
+        # the busy window IS the done-quiet window — one threshold, so
+        # amber hands off directly to green (or to nothing) at 30s quiet.
+        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
+                      re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(m)
+        self.assertIn("DONE_QUIET_MS", m.group(1),
+                      "checkBusy must hold busy through the quiet window")
+        self.assertNotIn("BUSY_TTL", self.html,
+                         "separate glow TTL must be gone — one threshold")
+
     def test_done_state_pruned(self):
         m = re.search(
             r"for\s*\(const k of \[\.\.\.prevHash\.keys\(\)\]\)(.{0,500})",
@@ -1328,7 +1259,6 @@ class WaitingFrontendTests(unittest.TestCase):
         self.assertIn("!seenKeys.has(k)", block)
         self.assertIn("prevHash.delete(k)", block)
         self.assertIn("lastChanged.delete(k)", block)
-        self.assertIn("fadeStart.delete(k)", block)
 
     def test_resize_rewrap_not_treated_as_activity(self):
         # Splitting a window resizes the sibling pane → content rewraps →

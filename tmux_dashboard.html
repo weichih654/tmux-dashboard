@@ -353,25 +353,9 @@
     animation: activity-breathe 1.6s ease-in-out infinite;
   }
 
-  /* fading = activity stopped; slow 60-second fade back to normal */
-  @keyframes busy-fade-out {
-    from {
-      background: rgba(230, 169, 74, 0.13);
-      border-color: rgba(230,169,74,0.5);
-      box-shadow: inset 0 0 0 1px rgba(230,169,74,0.55), 0 0 11px rgba(230,169,74,0.14);
-    }
-    to {
-      background: var(--bg3);
-      border-color: var(--border);
-      box-shadow: none;
-    }
-  }
-  .pane.is-fading {
-    animation: busy-fade-out 60s linear forwards;
-  }
 
   /* waiting = agent stopped and is asking the USER something — red glow.
-     Declared after is-busy/is-fading so it wins when classes co-occur. */
+     Declared after is-busy so it wins when classes co-occur. */
   @keyframes waiting-breathe {
     0%, 100% { box-shadow: inset 0 0 0 1px rgba(240,96,90,0.55), 0 0 11px rgba(240,96,90,0.16); }
     50%      { box-shadow: inset 0 0 0 1px rgba(240,96,90,0.95), 0 0 22px rgba(240,96,90,0.38); }
@@ -796,27 +780,25 @@ function notifyWaiting(key, label) {
 }
 
 // ── busy detection ──────────────────────────────────────────
-// A pane is "busy" for BUSY_TTL ms after its last activity, then slowly
-// fades back to normal over FADE_DURATION ms.
+// A pane is "busy" from its first output until DONE_QUIET_MS of silence,
+// then hands off to the done verdict (green frame or nothing) — no fade.
 //
 // Two activity sources, chosen by the server (data.activity_source):
 //   'tmux' — pane_last_activity (epoch seconds), native + catches output
 //            that scrolled away between polls. Used when tmux supports it.
 //   'hash' — compare preview content between polls. Fallback for older tmux.
-const BUSY_TTL      = 8000;   // ms of active glow after last activity
-const FADE_DURATION = 60000;  // ms for the slow fade-out (1 minute)
 const MIN_JOB_MS    = 30000;  // a busy streak must span this long to count
                               // as a "job" — one log burst never goes green
-const DONE_QUIET_MS = 30000;  // silence needed to call the job finished —
-                              // longer than the 8s glow TTL on purpose, so a
-                              // mid-job pause doesn't produce a false "done"
+const DONE_QUIET_MS = 30000;  // silence needed to call the job finished.
+                              // Also the amber-glow window: activity holds
+                              // until the done verdict (green or nothing) —
+                              // there is no fade-out in between
 const BIRTH_GRACE   = 5000;   // ms after first sighting where hash changes
                               // don't glow — a new pane drawing its shell
                               // prompt is not "activity"
 let   activitySource = 'hash'; // set from server response; safe default
 const prevHash    = new Map(); // key → last content hash   (hash mode)
 const lastChanged = new Map(); // key → timestamp of last change (hash mode)
-const fadeStart   = new Map(); // key → timestamp when fade-out began (hash mode)
 const donePending = new Set(); // key → job finished, unseen (green frame)
 const jobStart    = new Map(); // key → timestamp the current busy streak began
 const prevSize    = new Map(); // key → last pane size — a size change means
@@ -835,20 +817,17 @@ function paneKey(sessName, winIdx, paneIdx) {
   return `${sessName}:${winIdx}.${paneIdx}`;
 }
 
-// Returns { state: 'busy'|'fading'|'none', fadeElapsed: ms-into-fade }.
-// fadeElapsed feeds a negative animation-delay so the CSS fade lands at the
-// right point even though the DOM is rebuilt every render.
+// Returns { state: 'busy'|'none', lastTs }. A pane is busy from its first
+// output until DONE_QUIET_MS of silence — the amber state holds through the
+// whole quiet window so a qualifying job hands off DIRECTLY to the green
+// done frame (or to nothing). No fade-out stage.
 function checkBusy(key, pane) {
   const now = Date.now();
 
   if (activitySource === 'tmux') {
     // tmux gives the activity timestamp directly — fully stateless.
     const lastTs = pane.last_activity * 1000;
-    const elapsedMs = now - lastTs;
-    if (elapsedMs < BUSY_TTL) return { state: 'busy', fadeElapsed: 0, lastTs };
-    const fadeElapsed = elapsedMs - BUSY_TTL;
-    if (fadeElapsed < FADE_DURATION) return { state: 'fading', fadeElapsed, lastTs };
-    return { state: 'none', fadeElapsed: 0, lastTs };
+    return { state: (now - lastTs) < DONE_QUIET_MS ? 'busy' : 'none', lastTs };
   }
 
   // hash fallback — detect activity by content change between polls.
@@ -865,27 +844,13 @@ function checkBusy(key, pane) {
     const inBirthGrace = (now - paneBirth.get(key)) < BIRTH_GRACE;
     if (!sizeChanged && !inBirthGrace) {
       lastChanged.set(key, now);
-      fadeStart.delete(key);   // new activity cancels any in-progress fade
     }
   }
   prevHash.set(key, hash);
 
-  const changed = lastChanged.get(key);
-  const lastTs = changed || 0;
-  if (!changed) return { state: 'none', fadeElapsed: 0, lastTs };
-  if ((now - changed) < BUSY_TTL) return { state: 'busy', fadeElapsed: 0, lastTs };
-
-  // Past the active glow window — start or continue the slow fade.
-  // fadeStart and lastChanged are both KEPT after the fade completes (the
-  // vanish sweep prunes them): lastChanged feeds the done detector's
-  // quiet-gap measurement, and the surviving fadeStart entry is what stops
-  // the fade from restarting.
-  if (!fadeStart.has(key)) fadeStart.set(key, now);
-  const fadeElapsed = now - fadeStart.get(key);
-  if (fadeElapsed >= FADE_DURATION) {
-    return { state: 'none', fadeElapsed: 0, lastTs };
-  }
-  return { state: 'fading', fadeElapsed };
+  const lastTs = lastChanged.get(key) || 0;
+  if (!lastTs) return { state: 'none', lastTs };
+  return { state: (now - lastTs) < DONE_QUIET_MS ? 'busy' : 'none', lastTs };
 }
 
 // ── render ─────────────────────────────────────────────────
@@ -938,7 +903,7 @@ function render(data) {
         // a sibling is killed); composite key only for old servers / demo
         const key = pane.id || paneKey(sess.name, win.index, pane.index);
         seenKeys.add(key);
-        const { state: busyState, fadeElapsed, lastTs } = checkBusy(key, pane);
+        const { state: busyState, lastTs } = checkBusy(key, pane);
         const isWaiting = !!pane.waiting;
 
         // ── done detection: a busy streak that spanned ≥ MIN_JOB_MS and
@@ -955,13 +920,11 @@ function render(data) {
         }
         if (pane.current) donePending.delete(key);   // focused = seen
 
-        // priority: red waiting > amber busy > green done > fade
-        let isBusy   = busyState === 'busy';
-        let isFading = busyState === 'fading';
-        isBusy   = isBusy   && !isWaiting;
+        // priority: red waiting > amber busy > green done
+        let isBusy = busyState === 'busy';
+        isBusy = isBusy && !isWaiting;
         const isDone = donePending.has(key) && !isWaiting && !isBusy;
-        isFading = isFading && !isWaiting && !isDone;
-        if (isBusy) winBusy = true;  // window badge only for active busy, not slow fade
+        if (isBusy) winBusy = true;
         if (isWaiting) winWaiting = true;
         if (isDone) winDone = true;
 
@@ -988,12 +951,8 @@ function render(data) {
           notifiedWaiting.delete(key);
         }
 
-        // For fading panes, use a negative animation-delay so the CSS animation
-        // starts at the correct elapsed point even after DOM reconstruction.
-        const fadeStyle = isFading ? ` style="animation-delay:-${fadeElapsed}ms"` : '';
-
         const zTarget = `${sess.name}:${win.index}.${pane.index}`;
-        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isFading ? ' is-fading' : ''}${isWaiting ? ' is-waiting' : ''}${isDone ? ' is-done' : ''}"${fadeStyle}
+        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isWaiting ? ' is-waiting' : ''}${isDone ? ' is-done' : ''}"
           onclick="event.stopPropagation();openZoom('${escHtml(zTarget)}','${escHtml(mainLabel)}','${escHtml(pane.path)}','${escHtml(key)}')">
           <div class="pane-top">
             <span class="pane-cmd" title="${escHtml(mainLabel)}">${escHtml(mainLabel)}</span>
@@ -1082,7 +1041,6 @@ function render(data) {
     if (!seenKeys.has(k)) {
       prevHash.delete(k);
       lastChanged.delete(k);
-      fadeStart.delete(k);
       prevSize.delete(k);
       paneBirth.delete(k);
       donePending.delete(k);
