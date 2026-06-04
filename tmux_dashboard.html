@@ -383,6 +383,37 @@
     animation: waiting-breathe 1.3s ease-in-out infinite;
   }
 
+  /* done = a real job finished while you weren't looking — calm static
+     green frame, sticky until the pane is focused (HERE) or zoomed */
+  .pane.is-done {
+    border-color: rgba(61, 214, 140, 0.55);
+    box-shadow: inset 0 0 0 1px rgba(61, 214, 140, 0.35);
+  }
+
+  .done-badge {
+    font-size: 9px;
+    color: var(--active);
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    gap: 4px;
+  }
+
+  /* done roll-up in window/session headers (collapsed only) */
+  .win-done {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: var(--active);
+  }
+  .window:not(.collapsed) .win-done { display: none; }
+  .session:not(.collapsed) .win-done.sess { display: none; }
+
   .waiting-badge {
     font-size: 9px;
     color: var(--waiting);
@@ -774,6 +805,11 @@ function notifyWaiting(key, label) {
 //   'hash' — compare preview content between polls. Fallback for older tmux.
 const BUSY_TTL      = 8000;   // ms of active glow after last activity
 const FADE_DURATION = 60000;  // ms for the slow fade-out (1 minute)
+const MIN_JOB_MS    = 30000;  // a busy streak must span this long to count
+                              // as a "job" — one log burst never goes green
+const DONE_QUIET_MS = 30000;  // silence needed to call the job finished —
+                              // longer than the 8s glow TTL on purpose, so a
+                              // mid-job pause doesn't produce a false "done"
 const BIRTH_GRACE   = 5000;   // ms after first sighting where hash changes
                               // don't glow — a new pane drawing its shell
                               // prompt is not "activity"
@@ -781,6 +817,8 @@ let   activitySource = 'hash'; // set from server response; safe default
 const prevHash    = new Map(); // key → last content hash   (hash mode)
 const lastChanged = new Map(); // key → timestamp of last change (hash mode)
 const fadeStart   = new Map(); // key → timestamp when fade-out began (hash mode)
+const donePending = new Set(); // key → job finished, unseen (green frame)
+const jobStart    = new Map(); // key → timestamp the current busy streak began
 const prevSize    = new Map(); // key → last pane size — a size change means
                                // the content REWRAPPED (split/resize), not output
 const paneBirth   = new Map(); // key → timestamp the key was first seen
@@ -805,11 +843,12 @@ function checkBusy(key, pane) {
 
   if (activitySource === 'tmux') {
     // tmux gives the activity timestamp directly — fully stateless.
-    const elapsedMs = now - pane.last_activity * 1000;
-    if (elapsedMs < BUSY_TTL) return { state: 'busy', fadeElapsed: 0 };
+    const lastTs = pane.last_activity * 1000;
+    const elapsedMs = now - lastTs;
+    if (elapsedMs < BUSY_TTL) return { state: 'busy', fadeElapsed: 0, lastTs };
     const fadeElapsed = elapsedMs - BUSY_TTL;
-    if (fadeElapsed < FADE_DURATION) return { state: 'fading', fadeElapsed };
-    return { state: 'none', fadeElapsed: 0 };
+    if (fadeElapsed < FADE_DURATION) return { state: 'fading', fadeElapsed, lastTs };
+    return { state: 'none', fadeElapsed: 0, lastTs };
   }
 
   // hash fallback — detect activity by content change between polls.
@@ -832,16 +871,19 @@ function checkBusy(key, pane) {
   prevHash.set(key, hash);
 
   const changed = lastChanged.get(key);
-  if (!changed) return { state: 'none', fadeElapsed: 0 };
-  if ((now - changed) < BUSY_TTL) return { state: 'busy', fadeElapsed: 0 };
+  const lastTs = changed || 0;
+  if (!changed) return { state: 'none', fadeElapsed: 0, lastTs };
+  if ((now - changed) < BUSY_TTL) return { state: 'busy', fadeElapsed: 0, lastTs };
 
-  // Past the active glow window — start or continue the slow fade
+  // Past the active glow window — start or continue the slow fade.
+  // fadeStart and lastChanged are both KEPT after the fade completes (the
+  // vanish sweep prunes them): lastChanged feeds the done detector's
+  // quiet-gap measurement, and the surviving fadeStart entry is what stops
+  // the fade from restarting.
   if (!fadeStart.has(key)) fadeStart.set(key, now);
   const fadeElapsed = now - fadeStart.get(key);
   if (fadeElapsed >= FADE_DURATION) {
-    fadeStart.delete(key);
-    lastChanged.delete(key);
-    return { state: 'none', fadeElapsed: 0 };
+    return { state: 'none', fadeElapsed: 0, lastTs };
   }
   return { state: 'fading', fadeElapsed };
 }
@@ -879,7 +921,7 @@ function render(data) {
 
     const isCurrentSess = sess.current;
     const isCollapsed   = collapsedSessions.has(sess.name);
-    let sessBusy = false, sessWaiting = false;
+    let sessBusy = false, sessWaiting = false, sessDone = false;
 
     const windowsHtml = sess.windows.map(win => {
       totalPanes += win.panes.length;
@@ -889,21 +931,39 @@ function render(data) {
       const isActiveWin  = win.active;
       let winBusy = false;
       let winWaiting = false;
+      let winDone = false;
 
       const panesHtml = win.panes.map(pane => {
         // key by tmux pane_id (%N — unique, survives index renumbering when
         // a sibling is killed); composite key only for old servers / demo
         const key = pane.id || paneKey(sess.name, win.index, pane.index);
         seenKeys.add(key);
-        const { state: busyState, fadeElapsed } = checkBusy(key, pane);
+        const { state: busyState, fadeElapsed, lastTs } = checkBusy(key, pane);
         const isWaiting = !!pane.waiting;
-        // waiting wins — red glow replaces the amber busy/fading glow
+
+        // ── done detection: a busy streak that spanned ≥ MIN_JOB_MS and
+        // then went quiet for ≥ DONE_QUIET_MS turns green until seen.
+        if (busyState === 'busy') {
+          if (!jobStart.has(key)) jobStart.set(key, nowTs);
+          donePending.delete(key);   // it's running again — not done
+        } else if (jobStart.has(key) && lastTs &&
+                   (nowTs - lastTs) >= DONE_QUIET_MS) {
+          if ((lastTs - jobStart.get(key)) >= MIN_JOB_MS && !pane.current) {
+            donePending.add(key);
+          }
+          jobStart.delete(key);
+        }
+        if (pane.current) donePending.delete(key);   // focused = seen
+
+        // priority: red waiting > amber busy > green done > fade
         let isBusy   = busyState === 'busy';
         let isFading = busyState === 'fading';
         isBusy   = isBusy   && !isWaiting;
-        isFading = isFading && !isWaiting;
+        const isDone = donePending.has(key) && !isWaiting && !isBusy;
+        isFading = isFading && !isWaiting && !isDone;
         if (isBusy) winBusy = true;  // window badge only for active busy, not slow fade
         if (isWaiting) winWaiting = true;
+        if (isDone) winDone = true;
 
         const previewHtml = pane.preview.length
           ? `<div class="preview">${pane.preview.map(l =>
@@ -933,8 +993,8 @@ function render(data) {
         const fadeStyle = isFading ? ` style="animation-delay:-${fadeElapsed}ms"` : '';
 
         const zTarget = `${sess.name}:${win.index}.${pane.index}`;
-        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isFading ? ' is-fading' : ''}${isWaiting ? ' is-waiting' : ''}"${fadeStyle}
-          onclick="event.stopPropagation();openZoom('${escHtml(zTarget)}','${escHtml(mainLabel)}','${escHtml(pane.path)}')">
+        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isFading ? ' is-fading' : ''}${isWaiting ? ' is-waiting' : ''}${isDone ? ' is-done' : ''}"${fadeStyle}
+          onclick="event.stopPropagation();openZoom('${escHtml(zTarget)}','${escHtml(mainLabel)}','${escHtml(pane.path)}','${escHtml(key)}')">
           <div class="pane-top">
             <span class="pane-cmd" title="${escHtml(mainLabel)}">${escHtml(mainLabel)}</span>
           </div>
@@ -945,6 +1005,7 @@ function render(data) {
             ${pane.current ? '<span class="active-mark">▸ HERE</span>' : ''}
             ${isWaiting ? '<span class="waiting-badge"><span class="act-dot"></span>⏸ waiting</span>' : ''}
             ${isBusy ? '<span class="busy-badge"><span class="act-dot"></span>activity</span>' : ''}
+            ${isDone ? '<span class="done-badge">✓ done</span>' : ''}
             <span class="pane-size">${pane.size}</span>
           </div>
           <div class="pane-path">${escHtml(pane.path)}</div>
@@ -954,6 +1015,7 @@ function render(data) {
 
       if (winBusy) sessBusy = true;
       if (winWaiting) sessWaiting = true;
+      if (winDone) sessDone = true;
 
       // auto-fold bookkeeping — events refresh the clock and re-arm the
       // manual-expand exemption; quiet windows fold after the timeout
@@ -963,7 +1025,7 @@ function render(data) {
         winLastEvent.set(wkey, nowTs);
         manualExpand.delete(wkey);
       }
-      if (!hasCurrent && !manualExpand.has(wkey) &&
+      if (!hasCurrent && !winDone && !manualExpand.has(wkey) &&
           nowTs - winLastEvent.get(wkey) > AUTO_FOLD_AFTER) {
         collapsedWindows.add(wkey);
       }
@@ -976,7 +1038,8 @@ function render(data) {
           <div class="win-index">#${win.index}</div>
           <div class="win-name">${escHtml(win.name)}</div>
           ${winWaiting ? '<span class="win-waiting"><span class="act-dot"></span>⏸ waiting</span>'
-                       : winBusy ? '<span class="win-activity"><span class="act-dot"></span>activity</span>' : ''}
+                       : winBusy ? '<span class="win-activity"><span class="act-dot"></span>activity</span>'
+                       : winDone ? '<span class="win-done">✓ done</span>' : ''}
           <span class="win-spacer"></span>
           <div class="win-pane-count">${win.panes.length} pane${win.panes.length !== 1 ? 's' : ''}</div>
           <div class="win-collapse-icon">▾</div>
@@ -997,7 +1060,8 @@ function render(data) {
         <span class="session-icon">▾</span>
         <span class="session-name">${escHtml(sess.name)}</span>
         ${sessWaiting ? '<span class="win-waiting sess"><span class="act-dot"></span>⏸ waiting</span>'
-                      : sessBusy ? '<span class="win-activity sess"><span class="act-dot"></span>activity</span>' : ''}
+                      : sessBusy ? '<span class="win-activity sess"><span class="act-dot"></span>activity</span>'
+                      : sessDone ? '<span class="win-done sess">✓ done</span>' : ''}
         <span class="session-meta">${sess.window_count} win</span>
         ${tagHtml}
       </div>
@@ -1021,6 +1085,8 @@ function render(data) {
       fadeStart.delete(k);
       prevSize.delete(k);
       paneBirth.delete(k);
+      donePending.delete(k);
+      jobStart.delete(k);
     }
   }
   // prune window-keyed state too — a recreated window reusing the index
@@ -1193,7 +1259,8 @@ function escHtml(s) {
 let zoomTarget = null;
 let zoomTimer  = null;
 
-function openZoom(target, title, path) {
+function openZoom(target, title, path, paneStateKey) {
+  if (paneStateKey) donePending.delete(paneStateKey);   // inspected = seen
   zoomTarget = target;
   document.getElementById('zoom-target').textContent = target;
   document.getElementById('zoom-title').textContent  = title || target;

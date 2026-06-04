@@ -1118,6 +1118,84 @@ class AutoFoldTests(unittest.TestCase):
                          "winLastEvent must be pruned for vanished windows")
 
 
+class DonePendingTests(unittest.TestCase):
+    """Green 'done' frame: a real job finished while you weren't looking."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(HTML, encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_thresholds(self):
+        # ≥30s of activity qualifies as a job; ≥30s of silence ends it —
+        # separate from the 8s glow TTL so brief pauses mid-job don't
+        # produce a false "done".
+        m = re.search(r"MIN_JOB_MS\s*=\s*(\d+)", self.html)
+        self.assertIsNotNone(m, "MIN_JOB_MS missing")
+        self.assertEqual(int(m.group(1)), 30000)
+        m = re.search(r"DONE_QUIET_MS\s*=\s*(\d+)", self.html)
+        self.assertIsNotNone(m, "DONE_QUIET_MS missing")
+        self.assertEqual(int(m.group(1)), 30000)
+
+    def test_state_containers(self):
+        self.assertRegex(self.html, r"donePending\s*=\s*new Set")
+        self.assertRegex(self.html, r"jobStart\s*=\s*new Map")
+
+    def test_checkbusy_exposes_last_activity_ts(self):
+        # done detection needs WHEN the pane last changed, not just state
+        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
+                      re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(m)
+        self.assertIn("lastTs", m.group(1),
+                      "checkBusy must return the last-activity timestamp")
+
+    def test_short_burst_never_goes_green(self):
+        # qualification: streak span (lastTs - jobStart) >= MIN_JOB_MS
+        self.assertRegex(self.html, r"MIN_JOB_MS",
+                         "completion must require the minimum job duration")
+
+    def test_focus_clears_done(self):
+        # HERE pane (current) clears/never receives the green frame
+        self.assertRegex(self.html, r"pane\.current.{0,80}donePending\.delete|donePending\.delete\(key\)",
+                         "focusing the pane must clear done state")
+
+    def test_zoom_open_counts_as_seen(self):
+        m = re.search(r"function openZoom\((.*?)^}", self.html,
+                      re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(m)
+        self.assertIn("donePending.delete", m.group(0),
+                      "opening the zoom modal must clear done state")
+
+    def test_done_css_static_green(self):
+        self.assertRegex(self.html, r"\.pane\.is-done\s*\{[^}]*",
+                         ".pane.is-done CSS missing")
+        m = re.search(r"\.pane\.is-done\s*\{([^}]*)\}", self.html)
+        self.assertNotIn("animation", m.group(1),
+                         "done frame must be static — 'finished' is calm")
+        self.assertIn("done-badge", self.html, "✓ done badge missing")
+
+    def test_waiting_beats_done(self):
+        # priority: red waiting > green done
+        self.assertRegex(self.html, r"!isWaiting.{0,120}is-done|isDone\s*=.{0,80}!isWaiting",
+                         "waiting must override the done frame")
+
+    def test_done_blocks_auto_fold(self):
+        self.assertRegex(self.html, r"!winDone",
+                         "a window with a pending done frame must not auto-fold")
+
+    def test_done_rollup_when_collapsed(self):
+        self.assertIn("win-done", self.html,
+                      "collapsed window/session must roll up the done state")
+
+    def test_done_state_pruned(self):
+        m = re.search(
+            r"for\s*\(const k of \[\.\.\.prevHash\.keys\(\)\]\)(.{0,500})",
+            self.html, re.DOTALL)
+        self.assertIsNotNone(m)
+        self.assertIn("donePending.delete(k)", m.group(1))
+        self.assertIn("jobStart.delete(k)", m.group(1))
+
+
 class PaneIdTests(unittest.TestCase):
     """Panes are keyed by tmux pane_id (%N — unique, never renumbered).
 
