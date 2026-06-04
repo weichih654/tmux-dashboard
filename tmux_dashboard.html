@@ -22,6 +22,7 @@
     --session:   #4a9eff;
     --window:    #e6a94a;
     --active:    #3dd68c;
+    --waiting:   #f0605a;
     --cmd:       #7ec8e3;
     --path:      #6b9fd4;
     --preview:   #8a96a2;
@@ -375,6 +376,57 @@
     animation: busy-fade-out 60s linear forwards;
   }
 
+  /* waiting = agent stopped and is asking the USER something — red glow.
+     Declared after is-busy/is-fading so it wins when classes co-occur. */
+  @keyframes waiting-breathe {
+    0%, 100% { box-shadow: inset 0 0 0 1px rgba(240,96,90,0.55), 0 0 11px rgba(240,96,90,0.16); }
+    50%      { box-shadow: inset 0 0 0 1px rgba(240,96,90,0.95), 0 0 22px rgba(240,96,90,0.38); }
+  }
+  .pane.is-waiting {
+    background: rgba(240, 96, 90, 0.07);
+    border-color: rgba(240,96,90,0.55);
+    z-index: 2;
+    animation: waiting-breathe 1.3s ease-in-out infinite;
+  }
+
+  .waiting-badge {
+    font-size: 9px;
+    color: var(--waiting);
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    gap: 4px;
+  }
+  .waiting-badge .act-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--waiting);
+    box-shadow: 0 0 5px var(--waiting);
+    animation: busy-pulse 1.1s ease-in-out infinite;
+  }
+
+  /* waiting roll-up in the window header — like win-activity, red */
+  .win-waiting {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: auto;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: var(--waiting);
+  }
+  .win-waiting .act-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--waiting);
+    box-shadow: 0 0 6px var(--waiting);
+    animation: busy-pulse 1.1s ease-in-out infinite;
+  }
+  .window:not(.collapsed) .win-waiting { display: none; }
+
   @keyframes busy-pulse {
     0%, 100% { opacity: 1; }
     50%       { opacity: 0.2; }
@@ -678,6 +730,35 @@ slider.addEventListener('input', () => {
 const collapsedSessions = new Set();
 const collapsedWindows  = new Set();
 
+// ── waiting notification ───────────────────────────────────
+// Browser notification when a pane transitions not-waiting → waiting.
+// Deduped per pane: silent while the pane KEEPS waiting, re-armed once it
+// stops. Permission asked once on load; declined → notifications silently
+// skipped (the red glow still shows).
+const notifiedWaiting = new Set();
+if ('Notification' in window && Notification.permission === 'default') {
+  Notification.requestPermission();
+}
+
+// pane.title is attacker-influenced (select-pane -T / OSC escapes) and the
+// notification can show on a lock screen — strip C0+DEL+C1 control chars,
+// cap length.
+function sanitizeLabel(s) {
+  return String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 60);
+}
+
+// Returns true only when a notification actually fired — the caller gates
+// the dedupe entry on this, so a pane that turns waiting BEFORE the user
+// answers the permission prompt still notifies once permission arrives.
+function notifyWaiting(key, label) {
+  if (DEMO) return false;   // demo's simulated waiting pane must not notify
+  if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+  // tag dedupes at the OS level too, if a stale one is still on screen
+  const n = new Notification('tmux.dash', { body: `${sanitizeLabel(label)} 在等你回覆`, tag: key });
+  n.onclick = () => { window.focus(); n.close(); };
+  return true;
+}
+
 // ── busy detection ──────────────────────────────────────────
 // A pane is "busy" for BUSY_TTL ms after its last activity, then slowly
 // fades back to normal over FADE_DURATION ms.
@@ -720,8 +801,11 @@ function checkBusy(key, pane) {
     return { state: 'none', fadeElapsed: 0 };
   }
 
-  // hash fallback — detect activity by content change between polls
-  const hash = simpleHash(pane.preview.join('\n'));
+  // hash fallback — detect activity by content change between polls.
+  // Prefer the server's full-capture hash: it sees the spinner/timer line
+  // ticking ABOVE the static status bar that fills the 5-line preview.
+  // Old servers without the field → hash the preview as before.
+  const hash = pane.content_hash || simpleHash(pane.preview.join('\n'));
   if (prevHash.has(key) && prevHash.get(key) !== hash) {
     lastChanged.set(key, now);
     fadeStart.delete(key);   // new activity cancels any in-progress fade
@@ -763,6 +847,11 @@ function render(data) {
   dot.className = 'status-dot';
 
   let totalWindows = 0, totalPanes = 0;
+  // pane keys seen this render — panes killed WHILE waiting never hit the
+  // !isWaiting cleanup branch, so their notifiedWaiting entries are reaped
+  // against this set after the loop (else pane-index reuse would suppress
+  // a future real notification).
+  const seenKeys = new Set();
 
   const html = data.sessions.map(sess => {
     totalWindows += sess.window_count;
@@ -777,13 +866,20 @@ function render(data) {
       const winCollapsed = collapsedWindows.has(wkey);
       const isActiveWin  = win.active;
       let winBusy = false;
+      let winWaiting = false;
 
       const panesHtml = win.panes.map(pane => {
         const key = paneKey(sess.name, win.index, pane.index);
+        seenKeys.add(key);
         const { state: busyState, fadeElapsed } = checkBusy(key, pane);
-        const isBusy   = busyState === 'busy';
-        const isFading = busyState === 'fading';
+        const isWaiting = !!pane.waiting;
+        // waiting wins — red glow replaces the amber busy/fading glow
+        let isBusy   = busyState === 'busy';
+        let isFading = busyState === 'fading';
+        isBusy   = isBusy   && !isWaiting;
+        isFading = isFading && !isWaiting;
         if (isBusy) winBusy = true;  // window badge only for active busy, not slow fade
+        if (isWaiting) winWaiting = true;
 
         const previewHtml = pane.preview.length
           ? `<div class="preview">${pane.preview.map(l =>
@@ -799,12 +895,21 @@ function render(data) {
         const procTag = hasTitle
           ? `<span class="pane-proc">${escHtml(pane.command)}</span>` : '';
 
+        // notify on transition not-waiting → waiting, once per episode
+        if (isWaiting && !notifiedWaiting.has(key)) {
+          // gate on success: during the permission-prompt window nothing
+          // fires, and the episode must still notify once permission lands
+          if (notifyWaiting(key, mainLabel)) notifiedWaiting.add(key);
+        } else if (!isWaiting) {
+          notifiedWaiting.delete(key);
+        }
+
         // For fading panes, use a negative animation-delay so the CSS animation
         // starts at the correct elapsed point even after DOM reconstruction.
         const fadeStyle = isFading ? ` style="animation-delay:-${fadeElapsed}ms"` : '';
 
         const zTarget = `${sess.name}:${win.index}.${pane.index}`;
-        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isFading ? ' is-fading' : ''}"${fadeStyle}
+        return `<div class="pane${pane.active ? ' is-active' : ''}${pane.current ? ' is-current' : ''}${isBusy ? ' is-busy' : ''}${isFading ? ' is-fading' : ''}${isWaiting ? ' is-waiting' : ''}"${fadeStyle}
           onclick="event.stopPropagation();openZoom('${escHtml(zTarget)}','${escHtml(mainLabel)}','${escHtml(pane.path)}')">
           <div class="pane-top">
             <span class="pane-cmd" title="${escHtml(mainLabel)}">${escHtml(mainLabel)}</span>
@@ -814,6 +919,7 @@ function render(data) {
             ${procTag}
             <span class="pane-spacer"></span>
             ${pane.current ? '<span class="active-mark">▸ HERE</span>' : ''}
+            ${isWaiting ? '<span class="waiting-badge"><span class="act-dot"></span>⏸ waiting</span>' : ''}
             ${isBusy ? '<span class="busy-badge"><span class="act-dot"></span>activity</span>' : ''}
             <span class="pane-size">${pane.size}</span>
           </div>
@@ -829,7 +935,8 @@ function render(data) {
           <div class="win-index">#${win.index}</div>
           <div class="win-name">${escHtml(win.name)}</div>
           <div class="win-pane-count">${win.panes.length} pane${win.panes.length !== 1 ? 's' : ''}</div>
-          ${winBusy ? '<span class="win-activity"><span class="act-dot"></span>activity</span>' : ''}
+          ${winWaiting ? '<span class="win-waiting"><span class="act-dot"></span>⏸ waiting</span>'
+                       : winBusy ? '<span class="win-activity"><span class="act-dot"></span>activity</span>' : ''}
           <div class="win-collapse-icon">▾</div>
         </div>
         <div class="panes">${panesHtml}</div>
@@ -855,6 +962,11 @@ function render(data) {
   }).join('');
 
   main.innerHTML = html;
+
+  // reap dedupe entries for panes that vanished (closed while waiting)
+  for (const k of notifiedWaiting) {
+    if (!seenKeys.has(k)) notifiedWaiting.delete(k);
+  }
 
   // stats
   document.getElementById('session-count').textContent =
@@ -908,6 +1020,12 @@ function makeDemoData() {
           preview: ['> vite v5 ready in 312 ms', '> Local:   http://localhost:5173/',
             '> Network: use --host to expose', '> press h + enter to show help',
             ...(t % 3 === 0 ? ['> hmr update /src/app.jsx ' + stamp] : [])] },
+        // claude code: stopped on a permission prompt → waiting (red glow)
+        { index: '2', active: false, current: false, waiting: true,
+          command: 'claude', title: 'claude code', path: '~/dev/tmux-dashboard', size: '96×42',
+          preview: ['● Edit file tmux_server.py', 'Do you want to proceed?',
+            '❯ 1. Yes', '  2. Yes, and don\'t ask again',
+            '  3. No, and tell Claude what to do differently (esc)'] },
       ]},
       { index: '1', name: 'server', active: false, panes: [
         // python3 api: logs every tick → steadily lit (activity)

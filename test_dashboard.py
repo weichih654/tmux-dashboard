@@ -49,6 +49,19 @@ class ServerCaptureTests(unittest.TestCase):
         # the dangerous payload must be inside a single shlex-quoted token
         self.assertIn("'e'\"'\"'vil; rm -rf ~'", cmd)
 
+    def test_capture_includes_visible_pane(self):
+        # `-E -1` ends the capture at the LAST HISTORY LINE when scrollback
+        # exists — the entire visible pane is excluded, so previews go stale
+        # and waiting prompts (always on the visible screen) are invisible.
+        # Verified live: seq 1 30 into a 10-row pane, `-S -20 -E -1`
+        # captured only line "1". The end must stay at the visible bottom
+        # (default when -E is omitted).
+        cmd = srv.capture_cmd("sess:0.0")
+        self.assertNotIn("-E -1", cmd,
+                         "-E -1 cuts off the visible pane when history exists")
+        zoom_cmd = srv.capture_cmd("sess:0.0", srv.ZOOM_LINES)
+        self.assertNotIn("-E -1", zoom_cmd)
+
     def test_run_timeout_below_frontend_abort(self):
         # #1 — a single subprocess must time out well under the frontend's
         # abort window so one stuck call can't blow the whole response.
@@ -544,6 +557,551 @@ class ActivitySourceFrontendTests(unittest.TestCase):
         body = m.group(1)
         self.assertIn("fadeElapsed", body,
                       "checkBusy must return fadeElapsed for animation-delay")
+
+
+class WaitingDetectionTests(unittest.TestCase):
+    """Tests for detect_waiting() — agent waiting-for-user detection.
+
+    Scans only the LAST few non-empty lines of a pane capture so prompts
+    that scrolled away do not count. Patterns cover Claude Code, Codex,
+    Copilot CLI, Opencode, plus generic y/n prompts.
+    """
+
+    # ── plumbing ────────────────────────────────────────────
+
+    def test_detect_waiting_exists(self):
+        self.assertTrue(callable(getattr(srv, "detect_waiting", None)),
+                        "detect_waiting() missing from tmux_server")
+
+    def test_scan_window_constant(self):
+        # The scan window must exist and be big enough for a multi-line
+        # prompt UI (question + options + hint line) but bounded so old
+        # scrollback can't trigger.
+        self.assertTrue(hasattr(srv, "WAITING_SCAN_LINES"),
+                        "WAITING_SCAN_LINES constant missing")
+        self.assertGreaterEqual(srv.WAITING_SCAN_LINES, 4)
+        self.assertLessEqual(srv.WAITING_SCAN_LINES, 12)
+
+    # ── Claude Code ─────────────────────────────────────────
+
+    def test_claude_permission_menu(self):
+        lines = [
+            "  Bash command",
+            "  rm -rf node_modules",
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "  2. Yes, and don't ask again for this command",
+            "  3. No, and tell Claude what to do differently (esc)",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_claude_ask_user_question_enter_to_select(self):
+        # AskUserQuestion UI ends with an "Enter to select" hint line.
+        lines = [
+            "  Which approach do you prefer?",
+            "  ❯ 1. Option A",
+            "    2. Option B",
+            "  Enter to select",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_claude_esc_to_cancel_hint(self):
+        lines = [
+            "  Edit file src/app.py",
+            "  Esc to cancel",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_claude_working_spinner_not_waiting(self):
+        # While Claude works it shows "(esc to interrupt)" — must NOT count.
+        lines = [
+            "● Reading src/app.py…",
+            "✶ Pondering… (esc to interrupt)",
+        ]
+        self.assertFalse(srv.detect_waiting(lines))
+
+    # ── Codex ───────────────────────────────────────────────
+
+    def test_codex_approval_prompt(self):
+        lines = [
+            "  Codex wants to run:",
+            "  npm install",
+            "  Allow command?",
+            "▌ Yes (y)",
+            "  No, and tell Codex what to do differently (n)",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_codex_press_enter_to_confirm(self):
+        lines = [
+            "  apply patch to src/main.rs?",
+            "  Press Enter to confirm",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    # ── Copilot ─────────────────────────────────────────────
+
+    def test_copilot_numbered_yes(self):
+        lines = [
+            "  Allow this command?",
+            "  1. Yes",
+            "  2. No",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_copilot_allow_this(self):
+        lines = [
+            "  git push origin main",
+            "  Allow this command?",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    # ── Opencode ────────────────────────────────────────────
+
+    def test_opencode_permission_dialog(self):
+        lines = [
+            "  bash: rm -rf build/",
+            "  Permission required",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    # ── generic prompts ─────────────────────────────────────
+
+    def test_generic_y_slash_n(self):
+        self.assertTrue(srv.detect_waiting(["Overwrite existing file? (y/n)"]))
+
+    def test_generic_bracket_Yn(self):
+        self.assertTrue(srv.detect_waiting(["Apply changes? [Y/n]"]))
+
+    def test_generic_bracket_yN(self):
+        self.assertTrue(srv.detect_waiting(["Delete branch? [y/N]"]))
+
+    def test_generic_proceed_case_insensitive(self):
+        self.assertTrue(srv.detect_waiting(["PROCEED?"]))
+        self.assertTrue(srv.detect_waiting(["proceed?"]))
+
+    def test_generic_continue_question(self):
+        self.assertTrue(srv.detect_waiting(["Continue?"]))
+
+    # ── false positives / window bounds ─────────────────────
+
+    def test_scrolled_away_prompt_ignored(self):
+        # A prompt buried older than the scan window must NOT trigger —
+        # the user already answered and output continued.
+        lines = ["Do you want to proceed?", "❯ 1. Yes"]
+        lines += [f"output line {i}" for i in range(srv.WAITING_SCAN_LINES + 1)]
+        self.assertFalse(srv.detect_waiting(lines))
+
+    def test_plain_shell_prompt_not_waiting(self):
+        lines = [
+            "$ ls -la",
+            "total 48",
+            "drwxr-xr-x  6 wade  staff  192 Jun  4 10:00 .",
+            "$",
+        ]
+        self.assertFalse(srv.detect_waiting(lines))
+
+    def test_vim_buffer_with_old_yn_text(self):
+        # "(y/n)" mid-buffer with >scan-window lines after it must not count.
+        lines = ['  confirm("delete? (y/n)")']
+        lines += [f"    line{i} = {i}" for i in range(srv.WAITING_SCAN_LINES + 2)]
+        self.assertFalse(srv.detect_waiting(lines))
+
+    def test_empty_lines_list(self):
+        self.assertFalse(srv.detect_waiting([]))
+
+    def test_blank_only_lines(self):
+        self.assertFalse(srv.detect_waiting(["", "   ", "\t"]))
+
+    def test_blanks_interspersed_prompt_still_detected(self):
+        # Blank lines must not eat the scan window — only non-empty count.
+        lines = ["Do you want to proceed?", "", "❯ 1. Yes", "", "  2. No", ""]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_build_log_not_waiting(self):
+        lines = [
+            "Compiling foo v0.3.1",
+            "Compiling bar v1.2.0",
+            "Finished dev [unoptimized] target(s) in 4.21s",
+        ]
+        self.assertFalse(srv.detect_waiting(lines))
+
+    # ── false positives found in review round 1 ─────────────
+
+    def test_starship_shell_prompt_not_waiting(self):
+        # ❯ is the prompt char of starship/pure/spaceship themes. An idle
+        # shell whose last command starts digit-then-dot must NOT trigger.
+        self.assertFalse(srv.detect_waiting(["❯ 1.2.3 release notes"]))
+        self.assertFalse(srv.detect_waiting(["❯ 3.txt"]))
+
+    def test_allow_in_log_output_not_waiting(self):
+        self.assertFalse(srv.detect_waiting(["Allowed origins? checking config"]))
+        self.assertFalse(srv.detect_waiting(["curl: Allow-Control header missing, retry?"]))
+
+    def test_do_you_want_to_prose_not_waiting(self):
+        # mid-line prose without a trailing '?' must NOT trigger
+        self.assertFalse(srv.detect_waiting(
+            ["git log: Do you want to merge these branches manually later"]))
+
+    def test_numbered_yes_prose_not_waiting(self):
+        self.assertFalse(srv.detect_waiting(["   1. Yes it compiled"]))
+        self.assertFalse(srv.detect_waiting(["42. Yesterday we shipped"]))
+
+    def test_enter_to_select_prose_not_waiting(self):
+        self.assertFalse(srv.detect_waiting(
+            ["# Enter to select the menu item in docs"]))
+
+    def test_continue_in_code_not_waiting(self):
+        # source code shown in a pane — '?' is not at end of line
+        self.assertFalse(srv.detect_waiting(['print("continue?")']))
+
+    def test_claude_hint_after_middot_still_waiting(self):
+        # Claude footer hints are middot-separated, not line-anchored.
+        self.assertTrue(srv.detect_waiting(
+            ["↑/↓ to navigate · Enter to select · Esc to cancel"]))
+
+    def test_codex_no_option_line_waiting(self):
+        # design doc lists the Codex "No … (n)" option line as a pattern
+        self.assertTrue(srv.detect_waiting(
+            ["  No, and tell Codex what to do differently (n)"]))
+
+    # ── findings from review round 2 ────────────────────────
+
+    def test_agent_narration_prose_not_waiting(self):
+        # Agents stream narration ending in "continue?"/"proceed?" — prose,
+        # not a prompt. Only a standalone Proceed?/Continue? line counts.
+        self.assertFalse(srv.detect_waiting(["Tests pass. Should I continue?"]))
+        self.assertFalse(srv.detect_waiting(["The previous step did not proceed?"]))
+        self.assertFalse(srv.detect_waiting(["Now I will continue?"]))
+
+    def test_standalone_proceed_continue_still_waiting(self):
+        self.assertTrue(srv.detect_waiting(["Proceed?"]))
+        self.assertTrue(srv.detect_waiting(["  Continue?  "]))
+
+    def test_claude_box_drawn_dialog_waiting(self):
+        # Real Claude Code renders permission dialogs inside a border box —
+        # line-start anchors must see through the box-drawing characters.
+        lines = [
+            "╭──────────────────────────────────────╮",
+            "│ Bash command                         │",
+            "│   rm -rf node_modules                │",
+            "│ Do you want to proceed?              │",
+            "│ ❯ 1. Yes                             │",
+            "│   2. No, and tell Claude what to do  │",
+            "╰──────────────────────────────────────╯",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+    def test_box_border_lines_do_not_eat_scan_window(self):
+        # Border-only lines (╭───╮) must not count toward the scan window.
+        lines = ["Do you want to proceed?", "│ ❯ 1. Yes │"]
+        lines += ["╭──────╮", "╰──────╯"] * 3   # 6 border-only lines after
+        self.assertTrue(srv.detect_waiting(lines))
+
+    # ── answered-question echo (found in live use) ──────────
+
+    def test_answered_question_echo_not_waiting(self):
+        # After the user answers, Claude Code collapses the menu into a
+        # one-line echo in the transcript ("❯ 1. A 2. B 3. C") and goes back
+        # to work. Option-shaped lines WITHOUT a question/hint line in the
+        # window must NOT keep the pane red. Real capture from live use:
+        lines = [
+            "❯ 1. A 2. 所有qts的語言都要 3. OK 4. A",
+            "✢ Perusing… (1m 23s · almost done thinking with high effort)",
+            "⎿ Tip: Did you know you can drag and drop image files?",
+            "❯",
+            "Opus 4.8 │ ✍️ 30% │ some-branch (some-branch*) │ ● high",
+            "current ●●●●○○○○○○  48% ⟳ 4:00pm",
+            "weekly  ●●●○○○○○○○  32% ⟳ jun 8, 6:00pm",
+            "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        self.assertFalse(srv.detect_waiting(lines))
+
+    def test_bare_option_lines_without_question_not_waiting(self):
+        # Option-shaped lines in a doc/poll/checklist with no question or
+        # hint line must not trigger (round-2 finding, same root cause).
+        self.assertFalse(srv.detect_waiting(["Quick poll:", "1. Yes", "2. No"]))
+        self.assertFalse(srv.detect_waiting(["❯ 1. first item in my list"]))
+
+    def test_live_menu_with_hint_footer_still_waiting(self):
+        # A LIVE menu always carries its hint footer at the very bottom —
+        # weak option lines + strong hint line together must stay True.
+        lines = [
+            "多語儲存/選擇模型要用哪個?",
+            "❯ 1. 單檔全語言(前端選)",
+            "  2. 多檔每語言(serve 選)",
+            "  Chat about this",
+            "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel",
+        ]
+        self.assertTrue(srv.detect_waiting(lines))
+
+
+class WaitingPaneStateTests(unittest.TestCase):
+    """fetch_pane_state() returns preview + waiting from ONE capture."""
+
+    def test_fetch_pane_state_exists(self):
+        self.assertTrue(callable(getattr(srv, "fetch_pane_state", None)),
+                        "fetch_pane_state() missing from tmux_server")
+
+    def test_returns_preview_and_waiting(self):
+        raw = "\n".join([
+            "some earlier output",
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "  2. No",
+        ])
+        orig = srv.run
+        srv.run = lambda cmd: raw
+        try:
+            st = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertIsInstance(st, dict)
+        self.assertIn("preview", st)
+        self.assertIn("waiting", st)
+        self.assertTrue(st["waiting"])
+        self.assertLessEqual(len(st["preview"]), srv.PREVIEW_LINES)
+
+    def test_ansi_stripped_before_matching(self):
+        # Prompt wrapped in color codes must still match after ANSI strip.
+        raw = "\x1b[1mDo you want to proceed?\x1b[0m\n\x1b[36m❯ 1. Yes\x1b[0m"
+        orig = srv.run
+        srv.run = lambda cmd: raw
+        try:
+            st = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertTrue(st["waiting"])
+
+    def test_not_waiting_on_plain_output(self):
+        orig = srv.run
+        srv.run = lambda cmd: "hello\nworld"
+        try:
+            st = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertFalse(st["waiting"])
+
+    def test_never_raises(self):
+        # Same contract as fetch_preview — runs inside the parallel map.
+        orig = srv.run
+        srv.run = lambda cmd: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            st = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertEqual(st["preview"], [])
+        self.assertFalse(st["waiting"])
+
+    # ── content hash for activity detection (hash mode) ─────
+
+    def test_content_hash_present(self):
+        orig = srv.run
+        srv.run = lambda cmd: "hello\nworld"
+        try:
+            st = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertIn("content_hash", st)
+        self.assertIsInstance(st["content_hash"], str)
+        self.assertTrue(st["content_hash"])
+
+    def test_content_hash_sees_change_above_preview_window(self):
+        # Claude Code's spinner/timer line sits ABOVE the static status-bar
+        # lines that fill the 5-line preview. A tick that only changes the
+        # spinner line must still change the hash, or hash-mode activity
+        # detection goes blind while the agent thinks.
+        static_tail = ["❯", "Opus 4.8 | 35%", "current 53%", "weekly 33%",
+                       "bypass permissions on"]
+        cap1 = "\n".join(["✽ Booping… (11m 16s)"] + static_tail)
+        cap2 = "\n".join(["✽ Booping… (11m 17s)"] + static_tail)
+        orig = srv.run
+        try:
+            srv.run = lambda cmd: cap1
+            st1 = srv.fetch_pane_state("s:0.0")
+            srv.run = lambda cmd: cap2
+            st2 = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertEqual(st1["preview"], st2["preview"])          # preview blind
+        self.assertNotEqual(st1["content_hash"], st2["content_hash"])
+
+    def test_content_hash_stable_for_identical_content(self):
+        orig = srv.run
+        srv.run = lambda cmd: "same\ncontent\nlines"
+        try:
+            st1 = srv.fetch_pane_state("s:0.0")
+            st2 = srv.fetch_pane_state("s:0.0")
+        finally:
+            srv.run = orig
+        self.assertEqual(st1["content_hash"], st2["content_hash"])
+
+    def test_get_tmux_state_emits_content_hash(self):
+        import inspect
+        src = inspect.getsource(srv.get_tmux_state)
+        self.assertIn('"content_hash"', src,
+                      "get_tmux_state must put 'content_hash' on each pane")
+
+    def test_get_tmux_state_emits_waiting_field(self):
+        # Pane JSON must carry the waiting flag to the frontend.
+        import inspect
+        src = inspect.getsource(srv.get_tmux_state)
+        self.assertIn('"waiting"', src,
+                      "get_tmux_state must put 'waiting' on each pane")
+
+    def test_every_pane_has_waiting_bool_end_to_end(self):
+        # Full get_tmux_state() pass over a simulated tmux: EVERY pane must
+        # carry a boolean waiting flag, and a prompt-showing pane must be True.
+        orig_run = srv.run
+        orig_flag = srv._PANE_LAST_ACTIVITY_SUPPORT
+        srv._PANE_LAST_ACTIVITY_SUPPORT = None
+
+        def fake_run(cmd):
+            # order matters — later format strings embed the same variable
+            # names used by display-message probes
+            if "list-sessions" in cmd:
+                return "main|1|1"
+            if "list-windows" in cmd:
+                return "0|sh|1|2|layout"
+            if "list-panes" in cmd:
+                return ("0|1|zsh|/tmp|80|24|t1\n"
+                        "1|0|claude|/tmp|80|24|t2")
+            if "capture-pane" in cmd:
+                return "Do you want to proceed?\n❯ 1. Yes"
+            if "pane_last_activity" in cmd:
+                return ""          # probe → hash mode (7-field panes)
+            if "session_name" in cmd:
+                return "main"
+            if "window_index" in cmd:
+                return "0"
+            if "pane_index" in cmd:
+                return "0"
+            if "host_short" in cmd:
+                return "mac"
+            return ""
+
+        srv.run = fake_run
+        try:
+            state = srv.get_tmux_state()
+        finally:
+            srv.run = orig_run
+            srv._PANE_LAST_ACTIVITY_SUPPORT = orig_flag
+
+        panes = [p for s in state["sessions"]
+                 for w in s["windows"] for p in w["panes"]]
+        self.assertEqual(len(panes), 2)
+        for p in panes:
+            self.assertIn("waiting", p)
+            self.assertIsInstance(p["waiting"], bool)
+            self.assertTrue(p["waiting"])   # capture shows a live prompt
+
+
+class WaitingFrontendTests(unittest.TestCase):
+    """Frontend: red waiting glow, badge, rollup, browser notification."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(HTML, encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_is_waiting_css_class_defined(self):
+        self.assertRegex(self.html, r"\.pane\.is-waiting",
+                         ".pane.is-waiting CSS class missing")
+
+    def test_waiting_breathe_keyframes(self):
+        self.assertIn("waiting-breathe", self.html,
+                      "@keyframes waiting-breathe missing")
+
+    def test_render_uses_pane_waiting(self):
+        self.assertIn("pane.waiting", self.html,
+                      "render must read pane.waiting from API data")
+
+    def test_waiting_badge_in_template(self):
+        self.assertIn("waiting-badge", self.html,
+                      "pane card must show a waiting badge")
+
+    def test_waiting_overrides_busy_glow(self):
+        # A waiting pane must NOT also pulse amber — red wins.
+        self.assertRegex(self.html, r"isBusy\s*&&\s*!\s*(pane\.waiting|isWaiting)|!\s*(pane\.waiting|isWaiting)\s*&&\s*isBusy",
+                         "busy glow must be suppressed when waiting")
+
+    def test_window_header_waiting_rollup(self):
+        # Collapsed window must roll up a waiting indicator like win-activity.
+        self.assertIn("win-waiting", self.html,
+                      "collapsed window header must show waiting rollup")
+
+    def test_notification_permission_requested(self):
+        self.assertIn("Notification.requestPermission", self.html,
+                      "must request Notification permission")
+
+    def test_notification_fired(self):
+        self.assertIn("new Notification", self.html,
+                      "must fire a browser notification")
+
+    def test_notification_deduped_per_pane(self):
+        # Track panes already notified; only fire on not-waiting → waiting.
+        self.assertRegex(self.html, r"notifiedWaiting\s*=\s*new Set",
+                         "must dedupe notifications with a per-pane Set")
+        self.assertRegex(self.html, r"notifiedWaiting\.delete\(",
+                         "must clear the dedupe entry when pane stops waiting")
+
+    def test_notification_body_mentions_waiting(self):
+        self.assertIn("在等你回覆", self.html,
+                      "notification body must say the pane is waiting")
+
+    def test_demo_mode_has_waiting_pane(self):
+        # Demo data must include a simulated waiting pane for preview.
+        self.assertRegex(self.html, r"waiting:\s*true",
+                         "makeDemoData must include a waiting pane")
+
+    # ── fixes from review round 1 ───────────────────────────
+
+    def test_notified_set_reaped_for_vanished_panes(self):
+        # A pane killed WHILE waiting never hits the !isWaiting branch, so
+        # its dedupe key must be reaped by comparing against the keys seen
+        # in the current render — otherwise pane-index reuse suppresses a
+        # future real notification.
+        self.assertIn("seenKeys", self.html,
+                      "render must track keys seen this cycle")
+        self.assertRegex(self.html, r"!seenKeys\.has\(",
+                         "must prune notifiedWaiting entries for vanished panes")
+
+    def test_notification_label_sanitized(self):
+        # pane.title is attacker-influenced (select-pane -T / OSC escapes)
+        # and lands in an OS notification — control chars stripped, length
+        # capped.
+        self.assertIn("function sanitizeLabel", self.html,
+                      "notification label must go through sanitizeLabel()")
+        self.assertRegex(self.html, r"sanitizeLabel\(label\)|sanitizeLabel\(.*label",
+                         "notifyWaiting must sanitize the label")
+
+    def test_sanitize_covers_c1_controls(self):
+        # C1 range (-) must be stripped too, not just C0+DEL.
+        self.assertRegex(self.html, r"u007f-\\u009f",
+                         "sanitizeLabel must strip the C1 control range")
+
+    def test_checkbusy_prefers_server_content_hash(self):
+        # Hash mode must compare the server's full-capture content_hash
+        # (sees the spinner line above the status bar), falling back to
+        # hashing the preview only for old servers without the field.
+        m = re.search(r"function checkBusy\(.*?\)(.*?)^}", self.html,
+                      re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(m, "checkBusy not found")
+        body = m.group(1)
+        self.assertIn("content_hash", body,
+                      "checkBusy hash branch must use pane.content_hash")
+        self.assertIn("simpleHash", body,
+                      "preview hashing must remain as fallback")
+
+    def test_dedupe_key_only_recorded_when_notification_fired(self):
+        # During the permission-prompt window Notification.permission is
+        # 'default' — notifyWaiting() no-ops. The dedupe key must NOT be
+        # recorded then, or the first real notification of the episode is
+        # silently swallowed once permission is granted.
+        self.assertRegex(self.html, r"if\s*\(notifyWaiting\(",
+                         "notifiedWaiting.add must be gated on notifyWaiting() success")
+        self.assertRegex(self.html, r"function notifyWaiting[\s\S]*?return true",
+                         "notifyWaiting must report whether it actually fired")
 
 
 if __name__ == "__main__":

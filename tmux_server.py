@@ -10,6 +10,7 @@ import json
 import shlex
 import re
 import os
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -32,6 +33,93 @@ RUN_TIMEOUT = 2
 # only ever keep the last PREVIEW_LINES non-empty ones. Capturing a small
 # bottom slice keeps each call cheap regardless of pane height / activity.
 CAPTURE_LINES = 20
+# How many trailing NON-EMPTY lines detect_waiting() scans. Big enough for a
+# multi-line prompt UI (question + options + hint line), small enough that a
+# prompt the user already answered — scrolled up by later output — can't
+# re-trigger the waiting state.
+WAITING_SCAN_LINES = 8
+
+# Prompt patterns that mean an AI agent (or any CLI) stopped and is waiting
+# for the user to decide. Matched per line against the ANSI-stripped tail of
+# the capture. Sources: Claude Code, Codex, Copilot CLI, Opencode + generic
+# y/n prompts.
+#
+# Pane content is arbitrary (logs, docs, code, shell prompts), so every
+# pattern is anchored to the SHAPE of a real prompt line — substring-style
+# matching false-positives on prose ("Do you want to merge later"), logs
+# ("Allowed origins? checking config") and starship/pure shell prompts
+# ("❯ 3.txt"). Note "esc to cancel" (waiting) vs "esc to interrupt"
+# (working) — only the former may match.
+#
+# STRONG patterns prove a live prompt on their own: question lines, hint
+# footers, y/n tails. A live dialog always shows at least one (Claude's
+# menus keep their "Enter to select …" footer at the very bottom).
+WAITING_STRONG = [re.compile(p) for p in (
+    # Claude Code — question line: "Do you want to proceed?" (own line,
+    # ends with ?)
+    r"^\s*Do you want to .*\?\s*$",
+    # Claude Code / Copilot — hint line, either line-start or after a
+    # middot separator ("↑/↓ to navigate · Enter to select · Esc to cancel")
+    r"(?:^\s*|·\s*)Enter to select",
+    r"(?i)(?:^\s*|·\s*|\()esc to cancel",
+    # Codex — option lines "▌ Yes (y)" / "No, and tell Codex … (n)"
+    r"(?i)^\W*yes \(y\)\s*$",
+    r"^\W*No,?\s.*\(n\)\s*$",
+    r"(?:^\s*|·\s*)Press Enter to confirm",
+    # Codex / Copilot — approval question: line starts with "Allow",
+    # ends with "?" ("Allow command?", "Allow this command?")
+    r"^\s*Allow .*\?\s*$",
+    # Opencode — permission dialog title
+    r"(?i)^\s*permission required",
+    # generic — y/n prompts end the line
+    r"(?i)\(y/n\)\s*\??\s*$",
+    r"\[Y/n\]\s*$",
+    r"\[y/N\]\s*$",
+    # generic — standalone Proceed?/Continue? line. Must be the WHOLE line:
+    # agents stream narration ending in "…continue?" ("Tests pass. Should I
+    # continue?") which is prose, not a prompt.
+    r"(?i)^(proceed|continue)\?$",
+)]
+
+# WEAK patterns are option-SHAPED lines that also appear outside live
+# prompts — Claude Code collapses an ANSWERED question into a one-line echo
+# ("❯ 1. A 2. B 3. C") that lingers in the transcript, and docs/checklists
+# contain "1. Yes" lines. They carry no decision weight (a live dialog
+# always has a STRONG line, so STRONG-only deciding loses nothing); kept
+# for the flat debug view below.
+WAITING_WEAK = [re.compile(p) for p in (
+    # Claude Code — selected menu option: "❯ 1. Yes". \s after the dot
+    # rejects "❯ 1.2.3" / "❯ 3.txt" typed at a ❯-themed shell prompt.
+    r"^\s*❯\s*\d+\.\s+\S",
+    # Copilot — bare menu option: "1. Yes" / "2. No" (nothing after, so
+    # numbered prose like "1. Yes it compiled" doesn't count)
+    r"^\s*\d+\.\s+(Yes|No)\s*$",
+)]
+
+# Backwards-compatible flat view (debug tooling iterates this).
+WAITING_PATTERNS = WAITING_STRONG + WAITING_WEAK
+
+# Box-drawing characters Claude Code (and other TUIs) draw dialog borders
+# with. Stripped from line edges before matching so the line-start/-end
+# anchors in WAITING_PATTERNS see "❯ 1. Yes", not "│ ❯ 1. Yes      │".
+# Border-only lines (╭────╮) strip to empty and don't eat the scan window.
+_BOX_EDGE = "│┃║┆┇┊┋╎╏|╭╮╰╯┌┐└┘╔╗╚╝─━═"
+
+
+def detect_waiting(lines):
+    # True when the tail of the pane looks like a prompt waiting for the
+    # user. Only the last WAITING_SCAN_LINES non-empty lines count — blank
+    # and border-only lines are skipped so a boxed prompt is still seen,
+    # and anything older is treated as already-answered scrollback.
+    # Only STRONG patterns decide — WEAK (option-shaped) lines linger in
+    # transcripts after the question was answered; see the pattern comments.
+    tail = []
+    for l in lines:
+        cleaned = l.strip().strip(_BOX_EDGE).strip()
+        if cleaned:
+            tail.append(cleaned)
+    tail = tail[-WAITING_SCAN_LINES:]
+    return any(p.search(l) for l in tail for p in WAITING_STRONG)
 
 
 def run(cmd):
@@ -65,31 +153,49 @@ def tmux_supports_pane_last_activity():
 
 
 def capture_cmd(target, nlines=None):
-    # -S -N / -E -1 bounds the capture to the bottom N lines instead of the
-    # full visible pane, so cost is independent of how much the app redraws.
+    # -S -N starts the capture N lines into the history; the end is left at
+    # the default (bottom of the visible pane). NOT -E -1: when scrollback
+    # exists, -E -1 ends at the last HISTORY line and excludes the entire
+    # visible screen — previews go stale and prompts become invisible.
+    # Cost stays bounded: N history lines + one screenful.
     # shlex.quote(target) so a session name containing a quote/space can't
     # break out of the -t argument.
     n = nlines if nlines is not None else CAPTURE_LINES
     return (
         f"tmux capture-pane -t {shlex.quote(target)} -p -J "
-        f"-S -{n} -E -1 2>/dev/null"
+        f"-S -{n} 2>/dev/null"
     )
 
 
-def fetch_preview(target):
-    # Capture the pane, keep the last PREVIEW_LINES non-empty lines, strip ANSI.
+def fetch_pane_state(target):
+    # ONE capture → the preview (last PREVIEW_LINES non-empty lines,
+    # ANSI-stripped), the waiting flag (prompt detection on the tail) and a
+    # content hash over the WHOLE capture for hash-mode activity detection.
+    # The hash must cover more than the preview: Claude Code's spinner/timer
+    # line ticks ABOVE the static status-bar lines that fill the preview, so
+    # a preview-only hash goes blind while the agent thinks.
     # Must never raise: this runs inside a parallel map(), and an exception
     # there would abort the entire /api/tmux response (→ 500 → dashboard flash).
     try:
         raw = run(capture_cmd(target))
-        lines = [l for l in raw.splitlines() if l.strip()][-PREVIEW_LINES:]
-        return [_ANSI.sub('', l).rstrip() for l in lines]
+        lines = [_ANSI.sub('', l).rstrip() for l in raw.splitlines() if l.strip()]
+        return {
+            "preview": lines[-PREVIEW_LINES:],
+            "waiting": detect_waiting(lines),
+            "content_hash": format(zlib.crc32("\n".join(lines).encode()), "x"),
+        }
     except Exception:
-        return []
+        return {"preview": [], "waiting": False, "content_hash": ""}
+
+
+def fetch_preview(target):
+    # Preview-only view of fetch_pane_state — kept for compatibility.
+    return fetch_pane_state(target)["preview"]
 
 
 def fetch_zoom(target):
-    # Same as fetch_preview but captures ZOOM_LINES for the zoom modal.
+    # Like the preview but captures ZOOM_LINES for the zoom modal (and does
+    # its own strip/slice — no waiting detection needed here).
     # Must never raise — called from the HTTP handler on the main thread.
     try:
         raw = run(capture_cmd(target, ZOOM_LINES))
@@ -204,7 +310,9 @@ def get_tmux_state():
                     "path": short_path,
                     "size": f"{pwidth}×{pheight}",
                     "last_activity": f["last_activity"],
-                    "preview": [],   # filled in parallel after the tree is built
+                    "preview": [],        # filled in parallel after the tree is built
+                    "waiting": False,     # filled alongside preview
+                    "content_hash": "",   # full-capture hash for hash-mode activity
                 }
                 panes.append(pane)
                 preview_jobs.append((f"{sname}:{widx}.{pidx}", pane))
@@ -231,11 +339,13 @@ def get_tmux_state():
     if preview_jobs:
         workers = min(MAX_CAPTURE_WORKERS, len(preview_jobs))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for pane, preview in zip(
+            for pane, state in zip(
                 (p for _, p in preview_jobs),
-                ex.map(lambda job: fetch_preview(job[0]), preview_jobs),
+                ex.map(lambda job: fetch_pane_state(job[0]), preview_jobs),
             ):
-                pane["preview"] = preview
+                pane["preview"] = state["preview"]
+                pane["waiting"] = state["waiting"]
+                pane["content_hash"] = state["content_hash"]
 
     return {
         "sessions": sessions,
