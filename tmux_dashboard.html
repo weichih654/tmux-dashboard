@@ -262,13 +262,14 @@
     min-width: 18px;
   }
 
+  /* one title color for all expanded windows — the active window is
+     marked by its indicator dot, not an amber title */
   .win-name {
     font-size: 12px;
     font-weight: 500;
-    color: var(--window);
+    color: var(--text);
   }
   .win-spacer { flex: 1 1 auto; }
-  .window:not(.is-active) .win-name { color: var(--text); }
 
   .win-pane-count {
     font-size: 10px;

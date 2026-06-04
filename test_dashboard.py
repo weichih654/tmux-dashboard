@@ -1098,6 +1098,19 @@ class AutoFoldTests(unittest.TestCase):
         self.assertRegex(self.html, r"hasCurrent",
                          "auto-fold must check for the current (HERE) pane")
 
+    def test_expanded_title_color_uniform(self):
+        # Expanded window titles are all the same color — the active
+        # window is marked by its indicator dot, not an amber title.
+        m = re.search(r"\.win-name\s*\{([^}]*)\}", self.html)
+        self.assertIsNotNone(m, ".win-name rule missing")
+        self.assertIn("--text", m.group(1),
+                      "win-name base color must be --text")
+        self.assertNotIn("--window", m.group(1),
+                         "win-name must not use the amber accent")
+        self.assertNotRegex(self.html,
+                            r"\.window:not\(\.is-active\)\s+\.win-name",
+                            "per-active-window title color override must go")
+
     def test_window_state_maps_pruned(self):
         # Vanished windows must not leak entries (index reuse would
         # resurrect stale fold/exemption state).
