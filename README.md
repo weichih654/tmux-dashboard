@@ -6,6 +6,8 @@ A live web dashboard for tmux. See every session, window, and pane at a glance �
 
 ![tmux.dash demo](images/demo.gif)
 
+![tmux.dash preview](images/preview.png)
+
 ## Features
 
 - **Live overview** — all sessions → windows → panes rendered as cards, auto-refreshing (1–10s, adjustable)
