@@ -4,7 +4,7 @@ A live web dashboard for tmux. See every session, window, and pane at a glance â
 
 ![status](https://img.shields.io/badge/python-3.9%2B-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
-![tmux.dash preview](images/preview.png)
+![tmux.dash demo](images/demo.gif)
 
 ## Features
 
